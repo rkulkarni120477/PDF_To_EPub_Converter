@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Folio Foundry | PDF to ePub</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#" aria-label="Folio Foundry home">
+        <span class="brand-mark">F</span>
+        <span><strong>Folio</strong><small>FOUNDRY</small></span>
+      </a>
+      <nav class="primary-nav" aria-label="Primary navigation">
+        <a class="nav-item active" href="#workspace"><span class="nav-icon">+</span>Workspace</a>
+        <a class="nav-item" href="#library"><span class="nav-icon">[]</span>Library</a>
+        <a class="nav-item" href="#activity"><span class="nav-icon">~</span>Activity</a>
+        <a class="nav-item" href="#team"><span class="nav-icon">&</span>Team</a>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="storage-label"><span>Storage</span><span>68%</span></div>
+        <div class="storage-track"><span></span></div>
+        <p>6.8 GB of 10 GB used</p>
+        <a class="nav-item" href="#settings"><span class="nav-icon">*</span>Settings</a>
+        <div class="profile"><span class="avatar">RS</span><span><strong>Rahul S.</strong><small>Administrator</small></span><span class="chevron">v</span></div>
+      </div>
+    </aside>
+
+    <main class="main-content" id="workspace">
+      <header class="topbar">
+        <div class="breadcrumbs"><span>Workspace</span><b>/</b><strong>Spring Catalogue 2026</strong></div>
+        <div class="top-actions"><button class="icon-button" aria-label="Notifications">!</button><button class="help-button">Help</button></div>
+      </header>
+
+      <section class="page-heading">
+        <div><p class="eyebrow">CONVERSION WORKSPACE</p><h1>Spring Catalogue 2026</h1><p class="muted">Turn your source document into a polished, accessible eBook.</p></div>
+        <button class="outline-button" id="newProjectButton">+ New project</button>
+      </section>
+
+      <section class="stats-row" aria-label="Workspace statistics">
+        <article class="stat-card"><span class="stat-label">Conversion status</span><strong class="status-text"><i></i>Ready to convert</strong><span class="stat-foot">Last run 2 hours ago</span></article>
+        <article class="stat-card"><span class="stat-label">Current source</span><strong>spring-catalogue.pdf</strong><span class="stat-foot">42.8 MB / 128 pages</span></article>
+        <article class="stat-card"><span class="stat-label">Output profile</span><strong>ePub 3.2</strong><span class="stat-foot">Accessible + reflowable</span></article>
+      </section>
+
+      <section class="workspace-grid">
+        <div class="primary-column">
+          <article class="panel source-panel">
+            <div class="panel-heading"><div><span class="section-number">01</span><div><h2>Add your source</h2><p>Upload a PDF to begin a new conversion.</p></div></div><span class="file-type">PDF</span></div>
+            <div class="dropzone" id="dropzone" tabindex="0"><div class="upload-icon">^</div><h3 id="dropTitle">Drop your PDF here</h3><p id="dropText">or browse files from your computer</p><input id="fileInput" type="file" accept="application/pdf" hidden><button class="browse-button" id="browseButton">Choose PDF</button><span class="drop-hint">Maximum file size 250 MB</span></div>
+            <div class="source-file" id="sourceFile"><span class="pdf-badge">PDF</span><div><strong>spring-catalogue.pdf</strong><span>42.8 MB &middot; Added today</span></div><button class="remove-button" aria-label="Remove source">x</button></div>
+          </article>
+
+          <article class="panel settings-panel">
+            <div class="panel-heading"><div><span class="section-number">02</span><div><h2>Conversion settings</h2><p>Fine-tune the reading experience.</p></div></div><span class="settings-status">Defaults applied</span></div>
+            <div class="settings-grid"><label>Output format<select><option>ePub 3.2</option><option>ePub 3.0</option></select></label><label>Reading direction<select><option>Left to right</option><option>Right to left</option></select></label><label>Image quality<select><option>High (recommended)</option><option>Medium</option><option>Original</option></select></label><label>Layout<select><option>Reflowable</option><option>Fixed layout</option></select></label></div>
+            <label class="toggle-row"><span><strong>Run accessibility checks</strong><small>Validate headings, reading order, contrast, and alt text.</small></span><input type="checkbox" checked><span class="toggle"></span></label>
+          </article>
+        </div>
+
+        <aside class="secondary-column">
+          <article class="panel review-panel"><div class="panel-heading compact"><div><span class="section-number">03</span><div><h2>Review & convert</h2><p>Everything looks ready.</p></div></div></div><div class="check-list"><div><span class="check">ok</span><span>Source document added</span></div><div><span class="check">ok</span><span>Metadata detected</span></div><div><span class="check">ok</span><span>Output profile selected</span></div></div><button class="convert-button" id="convertButton">Start conversion <span>-&gt;</span></button><a class="download-link" id="downloadLink" hidden>Download ePub <span>-&gt;</span></a><p class="convert-note">Estimated time: 2-4 minutes</p></article>
+          <article class="panel activity-panel" id="activity"><div class="panel-heading compact"><div><h2>Recent activity</h2><a href="#activity">View all</a></div></div><div class="activity-item"><span class="activity-dot green"></span><div><strong>Conversion completed</strong><p>Winter catalogue.epub</p><small>Today, 09:42</small></div></div><div class="activity-item"><span class="activity-dot blue"></span><div><strong>New project created</strong><p>Spring Catalogue 2026</p><small>Today, 09:18</small></div></div><div class="activity-item"><span class="activity-dot amber"></span><div><strong>Review requested</strong><p>Brand guidelines.pdf</p><small>Yesterday, 16:04</small></div></div></article>
+        </aside>
+      </section>
+      <footer><span>Folio Foundry</span><span>All systems operational</span><span>v0.1 workspace preview</span></footer>
+    </main>
+  </div>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="app.js"></script>
+</body>
+</html>

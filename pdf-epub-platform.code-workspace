@@ -1,0 +1,12 @@
+{
+  "folders": [
+    { "path": "services" },
+    { "path": "web" },
+    { "path": "shared" },
+    { "path": "infra" }
+  ],
+  "settings": {
+    "python.testing.pytestEnabled": true,
+    "python.testing.unittestEnabled": false
+  }
+}

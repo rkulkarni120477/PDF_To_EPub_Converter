@@ -1,0 +1,35 @@
+services:
+  api-gateway:
+    build: ../../services/api-gateway
+    ports:
+      - "8000:8000"
+  pdf-extraction-service:
+    build: ../../services/pdf-extraction-service
+  content-processing-service:
+    build: ../../services/content-processing-service
+  content-enrichment-service:
+    build: ../../services/content-enrichment-service
+  metadata-service:
+    build: ../../services/metadata-service
+  media-asset-service:
+    build: ../../services/media-asset-service
+  preview-service:
+    build: ../../services/preview-service
+  epub-composition-service:
+    build: ../../services/epub-composition-service
+  validation-service:
+    build: ../../services/validation-service
+  version-service:
+    build: ../../services/version-service
+  collaboration-service:
+    build: ../../services/collaboration-service
+  packaging-service:
+    build: ../../services/packaging-service
+  job-orchestration-service:
+    build: ../../services/job-orchestration-service
+  notification-service:
+    build: ../../services/notification-service
+  download-service:
+    build: ../../services/download-service
+  reporting-service:
+    build: ../../services/reporting-service
