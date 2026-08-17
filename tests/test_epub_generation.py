@@ -76,6 +76,28 @@ class EpubGenerationTests(unittest.TestCase):
         self.assertIn("text src=", overlay)
         self.assertIn("audio src=", overlay)
 
+    @patch("app.main.synthesize_speech", return_value=(b"audio", 1.0))
+    def test_form_widgets_are_rendered(self, _speech):
+        page = {
+            "width": 612,
+            "height": 792,
+            "rotation": 0,
+            "text": "Form page",
+            "page_image": b"page image",
+            "blocks": [
+                {"type": "widget", "bbox": (50, 50, 250, 75), "field_type": "text", "name": "full_name", "value": "Rahul", "choices": [], "checked": False},
+                {"type": "widget", "bbox": (50, 90, 70, 110), "field_type": "checkbox", "name": "approved", "value": "Yes", "choices": [], "checked": True},
+                {"type": "widget", "bbox": (50, 120, 200, 145), "field_type": "select", "name": "role", "value": "Editor", "choices": ["Author", "Editor"], "checked": False},
+            ],
+        }
+        with zipfile.ZipFile(io.BytesIO(build_epub("Form test", [page]))) as archive:
+            content = archive.read("OEBPS/page-1.xhtml").decode("utf-8")
+        self.assertIn('name="full_name"', content)
+        self.assertIn('value="Rahul"', content)
+        self.assertIn('type="checkbox"', content)
+        self.assertIn('name="role"', content)
+        self.assertIn("<option", content)
+
 
 if __name__ == "__main__":
     unittest.main()

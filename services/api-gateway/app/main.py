@@ -138,6 +138,24 @@ def extract_pdf_pages(source: bytes) -> list[dict[str, object]]:
                         page_text.append("".join(line_text))
                 if lines:
                     blocks.append({"type": "text", "bbox": block["bbox"], "lines": lines})
+            for widget in page.widgets() or []:
+                field_type = {
+                    getattr(fitz, "PDF_WIDGET_TYPE_TEXT", 7): "text",
+                    getattr(fitz, "PDF_WIDGET_TYPE_CHECKBOX", 2): "checkbox",
+                    getattr(fitz, "PDF_WIDGET_TYPE_RADIOBUTTON", 5): "radio",
+                    getattr(fitz, "PDF_WIDGET_TYPE_COMBOBOX", 3): "select",
+                    getattr(fitz, "PDF_WIDGET_TYPE_LISTBOX", 4): "select",
+                }.get(widget.field_type, "text")
+                choices = list(widget.choice_values or [])
+                blocks.append({
+                    "type": "widget",
+                    "bbox": tuple(widget.rect),
+                    "field_type": field_type,
+                    "name": widget.field_name or f"field-{len(blocks) + 1}",
+                    "value": widget.field_value or "",
+                    "choices": choices,
+                    "checked": bool(widget.field_value and widget.field_value not in ("Off", "0")),
+                })
             pages.append({
                 "width": page.rect.width,
                 "height": page.rect.height,
@@ -195,7 +213,7 @@ def build_epub(title: str, pages: list[dict[str, object]]) -> bytes:
 </package>'''
     nav_items = "".join(f'<li><a href="{name}">Page {index}</a></li>' for index, (name, _) in enumerate(page_documents, start=1))
     nav = f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{safe_title}</title></head><body><nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><h1>Contents</h1><ol>{nav_items}</ol></nav></body></html>'''
-    style = ".-epub-media-overlay-active { background: #fff2a8 !important; } .page { position: relative; overflow: hidden; page-break-after: always; } .page-text { position: absolute; inset: 0; z-index: 2; } .pdf-page-background { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 1; } .pdf-text { position: absolute; white-space: pre; overflow: visible; color: transparent !important; } .pdf-span { display: inline; vertical-align: baseline; color: transparent !important; } .pdf-span.-epub-media-overlay-active { color: transparent !important; background: #fff2a8 !important; } .pdf-image { display: none; }"
+    style = ".-epub-media-overlay-active { background: #fff2a8 !important; } .page { position: relative; overflow: hidden; page-break-after: always; } .page-text { position: absolute; inset: 0; z-index: 2; } .pdf-page-background { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 1; } .pdf-text { position: absolute; white-space: pre; overflow: visible; color: transparent !important; } .pdf-span { display: inline; vertical-align: baseline; color: transparent !important; } .pdf-span.-epub-media-overlay-active { color: transparent !important; background: #fff2a8 !important; } .pdf-image { display: none; } .pdf-widget { position: absolute; z-index: 4; box-sizing: border-box; font: inherit; color: #111; background: rgba(255,255,255,.88); border: 1px solid #4d6670; padding: 2px 4px; } .pdf-checkbox, .pdf-radio { padding: 0; accent-color: #0c7770; background: rgba(255,255,255,.95); } .pdf-select { padding: 0 2px; }"
     output = BytesIO()
     with ZipFile(output, "w") as archive:
         archive.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
@@ -227,6 +245,9 @@ def render_page(page: dict[str, object], index: int, width: float, height: float
             images.append((image_name, block["data"]))
             markup.append(f'<img class="pdf-image" src="images/page-{index}-{block_index}.{block["ext"]}" style="left:{left:.2f}px;top:{top:.2f}px;width:{block_width:.2f}px;height:{block_height:.2f}px;" alt="Page {index} image"/>')
             continue
+        if block["type"] == "widget":
+            markup.append(render_widget(block, left, top, block_width, block_height))
+            continue
         for line_index, line in enumerate(block["lines"]):
             line_left, line_top, line_right, line_bottom = transform_bbox(line["bbox"], width, height, rotation)
             line_height = max(line_bottom - line_top, 1)
@@ -244,6 +265,26 @@ def render_page(page: dict[str, object], index: int, width: float, height: float
                 f'<div class="pdf-text" id="page-{index}-line-{line_index}" style="left:{line_left:.2f}px;top:{line_top:.2f}px;width:{max(line_right - line_left, 1):.2f}px;height:{line_height:.2f}px;line-height:{line_height:.2f}px;">{"".join(inline_spans)}</div>'
             )
     return "".join(markup), images
+
+
+def render_widget(widget: dict[str, object], left: float, top: float, width: float, height: float) -> str:
+    name = escape(str(widget["name"]), quote=True)
+    value = escape(str(widget["value"]), quote=True)
+    field_type = widget["field_type"]
+    style = f"left:{left:.2f}px;top:{top:.2f}px;width:{width:.2f}px;height:{height:.2f}px;"
+    if field_type == "checkbox":
+        checked = " checked" if widget["checked"] else ""
+        return f'<input class="pdf-widget pdf-checkbox" type="checkbox" name="{name}" value="{value or "on"}"{checked} style="{style}" aria-label="{name}"/>'
+    if field_type == "radio":
+        checked = " checked" if widget["checked"] else ""
+        return f'<input class="pdf-widget pdf-radio" type="radio" name="{name}" value="{value or "on"}"{checked} style="{style}" aria-label="{name}"/>'
+    if field_type == "select":
+        options = "".join(
+            f'<option value="{escape(str(choice), quote=True)}"{" selected" if str(choice) == str(widget["value"]) else ""}>{escape(str(choice))}</option>'
+            for choice in widget["choices"]
+        )
+        return f'<select class="pdf-widget pdf-select" name="{name}" style="{style}" aria-label="{name}">{options}</select>'
+    return f'<input class="pdf-widget pdf-input" type="text" name="{name}" value="{value}" style="{style}" aria-label="{name}"/>'
 
 
 def transform_bbox(bbox: tuple[float, float, float, float], width: float, height: float, rotation: int) -> tuple[float, float, float, float]:
