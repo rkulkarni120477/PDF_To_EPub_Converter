@@ -3,10 +3,10 @@ import sys
 import unittest
 import zipfile
 import xml.etree.ElementTree as ElementTree
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, "services/api-gateway")
-from app.main import AzureExtractionError, build_epub, merge_azure_text
+from app.main import AzureExtractionError, build_epub, extract_with_azure_di, merge_azure_text
 
 
 class EpubGenerationTests(unittest.TestCase):
@@ -154,6 +154,25 @@ class EpubGenerationTests(unittest.TestCase):
 
     def test_azure_configuration_error_is_explicit(self):
         self.assertTrue(issubclass(AzureExtractionError, RuntimeError))
+
+    @patch.dict("app.main.os.environ", {
+        "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT": "https://example.cognitiveservices.azure.com/",
+        "AZURE_DOCUMENT_INTELLIGENCE_KEY": "test-key",
+    })
+    @patch("app.main.DocumentIntelligenceClient")
+    def test_azure_pdf_is_sent_as_application_pdf(self, client_class):
+        client = client_class.return_value
+        result_page = MagicMock()
+        result_page.lines = [MagicMock(content="Azure line")]
+        client.begin_analyze_document.return_value.result.return_value.pages = [result_page]
+
+        pages = extract_with_azure_di(b"%PDF-test")
+
+        call = client.begin_analyze_document.call_args
+        self.assertEqual(call.args[0], "prebuilt-layout")
+        self.assertEqual(call.kwargs["content_type"], "application/pdf")
+        self.assertEqual(call.kwargs["body"].read(), b"%PDF-test")
+        self.assertEqual(pages[0]["text"], "Azure line")
 
     @staticmethod
     def _page(text: str) -> dict[str, object]:

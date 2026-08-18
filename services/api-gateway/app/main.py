@@ -17,6 +17,7 @@ import pymupdf as fitz
 import pyttsx3
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
+from azure.core.exceptions import HttpResponseError, ServiceRequestError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -130,9 +131,22 @@ def extract_with_azure_di(source: bytes) -> list[dict[str, object]]:
     if not endpoint or not key:
         raise AzureExtractionError("Azure Document Intelligence is enabled, but AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT and AZURE_DOCUMENT_INTELLIGENCE_KEY are not configured for the gateway process.")
     try:
-        client = DocumentIntelligenceClient(endpoint=endpoint, credential=AzureKeyCredential(key))
-        poller = client.begin_analyze_document("prebuilt-layout", body=source)
+        client = DocumentIntelligenceClient(endpoint=endpoint.rstrip("/"), credential=AzureKeyCredential(key))
+        poller = client.begin_analyze_document(
+            "prebuilt-layout",
+            body=BytesIO(source),
+            content_type="application/pdf",
+        )
         result = poller.result()
+    except HttpResponseError as error:
+        status_code = getattr(error, "status_code", None)
+        if status_code in (401, 403):
+            raise AzureExtractionError("Azure Document Intelligence rejected the credentials or endpoint (HTTP authentication error).") from error
+        if status_code == 400:
+            raise AzureExtractionError("Azure Document Intelligence rejected the PDF as invalid or unsupported (HTTP 400).") from error
+        raise AzureExtractionError(f"Azure Document Intelligence returned an error{f' (HTTP {status_code})' if status_code else ''}.") from error
+    except ServiceRequestError as error:
+        raise AzureExtractionError("Azure Document Intelligence could not be reached. Check the endpoint and network connection.") from error
     except Exception as error:
         raise AzureExtractionError("Azure Document Intelligence could not extract this PDF.") from error
     pages: list[dict[str, object]] = []
