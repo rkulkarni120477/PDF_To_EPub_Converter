@@ -15,6 +15,8 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, StreamingResponse
 import pymupdf as fitz
 import pyttsx3
+import cv2
+import numpy as np
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import HttpResponseError, ServiceRequestError
@@ -151,8 +153,21 @@ def extract_with_azure_di(source: bytes) -> list[dict[str, object]]:
         raise AzureExtractionError("Azure Document Intelligence could not extract this PDF.") from error
     pages: list[dict[str, object]] = []
     for page in result.pages or []:
-        lines = [{"text": line.content, "spans": []} for line in (page.lines or []) if line.content.strip()]
-        pages.append({"text": "\n".join(line["text"] for line in lines), "lines": lines})
+        lines = [
+            {"text": line.content, "spans": [], "polygon": list(line.polygon or [])}
+            for line in (page.lines or []) if line.content.strip()
+        ]
+        words = [
+            {"text": word.content, "polygon": list(word.polygon or [])}
+            for word in (page.words or []) if word.content.strip()
+        ]
+        pages.append({
+            "text": "\n".join(line["text"] for line in lines),
+            "lines": lines,
+            "words": words,
+            "width": page.width,
+            "height": page.height,
+        })
     return pages
 
 
@@ -162,7 +177,48 @@ def merge_azure_text(pages: list[dict[str, object]], azure_pages: list[dict[str,
             continue
         pages[index]["text"] = azure_page["text"]
         pages[index]["azure_lines"] = azure_page["lines"]
+        pages[index]["background_image_text"] = azure_page["text"]
+        azure_width = azure_page.get("width", pages[index]["width"])
+        azure_height = azure_page.get("height", pages[index]["height"])
+        pages[index]["azure_width"] = azure_width
+        pages[index]["azure_height"] = azure_height
+        pages[index]["page_image"] = remove_ocr_text_from_background(
+            pages[index]["page_image"], azure_page.get("words", []) or azure_page["lines"], azure_width, azure_height
+        )
     return pages
+
+
+def remove_ocr_text_from_background(
+    image_bytes: bytes,
+    lines: list[dict[str, object]],
+    ocr_width: float,
+    ocr_height: float,
+) -> bytes:
+    image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None or not ocr_width or not ocr_height:
+        return image_bytes
+    mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    image_height, image_width = image.shape[:2]
+    for line in lines:
+        polygon = line.get("polygon", [])
+        points = [
+            (
+                round(float(polygon[i]) / ocr_width * image_width),
+                round(float(polygon[i + 1]) / ocr_height * image_height),
+            )
+            for i in range(0, len(polygon) - 1, 2)
+        ]
+        if len(points) >= 3:
+            cv2.fillPoly(mask, [np.array(points, dtype=np.int32)], 255)
+    if not np.any(mask):
+        return image_bytes
+    scale = min(image_width / ocr_width, image_height / ocr_height)
+    padding = max(2, round(scale * 1.5))
+    kernel_size = padding * 2 + 1
+    mask = cv2.dilate(mask, np.ones((kernel_size, kernel_size), dtype=np.uint8), iterations=1)
+    cleaned = cv2.inpaint(image, mask, max(3, padding), cv2.INPAINT_TELEA)
+    success, encoded = cv2.imencode(".png", cleaned)
+    return encoded.tobytes() if success else image_bytes
 
 
 @app.get("/api/v1/downloads/{conversion_id}")
@@ -228,6 +284,7 @@ def extract_pdf_pages(source: bytes) -> list[dict[str, object]]:
     try:
         for page in document:
             page_dict = page.get_text("dict")
+            complete_text = page.get_text("text", sort=True).strip()
             blocks: list[dict[str, object]] = []
             page_text: list[str] = []
             for block in page_dict.get("blocks", []):
@@ -283,7 +340,7 @@ def extract_pdf_pages(source: bytes) -> list[dict[str, object]]:
                 "height": page.rect.height,
                 "rotation": page.rotation,
                 "blocks": blocks,
-                "text": " ".join(page_text).strip(),
+                "text": complete_text or " ".join(page_text).strip(),
                 "page_image": page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).tobytes("png"),
                 "media": media,
             })
@@ -354,8 +411,8 @@ def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto")
         rotation = int(page["rotation"])
         page_width, page_height = (height, width) if rotation in (90, 270) else (width, height)
         if fixed_layout:
-            markup, page_images = render_page(page, index, width, height, rotation)
-            markup = render_fixed_accessibility_layer(page, index)
+            markup, page_images = render_page(page, index, width, height, rotation, include_text=False)
+            markup = f'{render_fixed_accessibility_layer(page, index)}{markup}'
         else:
             markup, page_images = render_reflow_page(page, index)
         media_markup, page_media_files = render_media(page.get("media", []), index, width, height, rotation, fixed_layout)
@@ -367,7 +424,7 @@ def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto")
             markup = f'{markup}{media_markup}'
         page_name = f"page-{index}.xhtml"
         page_documents.append(
-            (page_name, f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{escape(title)} - Page {index}</title><meta charset="utf-8"/><meta name="viewport" content="width={page_width:.0f}, height={page_height:.0f}"/><link rel="stylesheet" type="text/css" href="style.css"/></head><body><section id="page-{index}" class="page {resolved_layout}" style="{f"width:{page_width:.2f}px;height:{page_height:.2f}px;" if fixed_layout else ""}" data-rotation="{rotation}"><div id="page-{index}-text" class="page-text">{markup}</div></section></body></html>''')
+            (page_name, f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{escape(title)} - Page {index}</title><meta charset="utf-8"/><meta name="viewport" content="width={page_width:.0f}, height={page_height:.0f}"/><link rel="stylesheet" type="text/css" href="style.css"/></head><body><section id="page-{index}" class="page {resolved_layout}" style="{f"width:{page_width:.2f}px;height:{page_height:.2f}px;" if fixed_layout else ""}" data-rotation="{rotation}"><div id="page-{index}-content" class="page-text">{markup}</div></section></body></html>''')
         )
         image_files.extend((name, data, Path(name).suffix.lstrip(".")) for name, data in page_images)
         media_files.extend(page_media_files)
@@ -396,7 +453,7 @@ def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto")
 </package>'''
     nav_items = "".join(f'<li><a href="{name}">Page {index}</a></li>' for index, (name, _) in enumerate(page_documents, start=1))
     nav = f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{safe_title}</title></head><body><nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><h1>Contents</h1><ol>{nav_items}</ol></nav></body></html>'''
-    style = ".-epub-media-overlay-active { background: #fff2a8 !important; } .page { margin: 0 auto; } .page.fixed { position: relative; overflow: hidden; page-break-after: always; } .page.reflowable { max-width: 48rem; padding: 2rem 1.5rem; } .fixed .page-text { position: absolute; inset: 0; z-index: 2; } .fixed .accessibility-text { width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: normal; border: 0; } .fixed .accessibility-text p { margin: 0; } .pdf-page-background { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 1; } .pdf-span { display: inline; vertical-align: baseline; } .reflow-image { display: block; max-width: 100%; height: auto; margin: 1rem auto; } .reflow-paragraph { margin: 0 0 .75rem; line-height: 1.45; } .reflow-field { display: block; margin: .75rem 0; color: #17232b; } .reflow-field input, .reflow-field select { margin-left: .5rem; padding: .35rem; } .pdf-widget { position: absolute; z-index: 4; box-sizing: border-box; font: inherit; color: #111; background: rgba(255,255,255,.88); border: 1px solid #4d6670; padding: 2px 4px; } .pdf-checkbox, .pdf-radio { padding: 0; accent-color: #0c7770; background: rgba(255,255,255,.95); } .pdf-select { padding: 0 2px; } .pdf-media { z-index: 5; background: rgba(255,255,255,.95); }"
+    style = ".-epub-media-overlay-active { background: #fff2a8 !important; } .page { margin: 0 auto; } .page.fixed { position: relative; overflow: hidden; page-break-after: always; } .page.reflowable { max-width: 48rem; padding: 2rem 1.5rem; } .fixed .page-text { position: absolute; inset: 0; z-index: 2; } .fixed .accessibility-text { width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: normal; border: 0; } .fixed .accessibility-text p { margin: 0; } .fixed .ocr-text-layer { width: auto; height: auto; margin: 0; overflow: visible; clip: auto; white-space: normal; color: #17232b; } .fixed .ocr-line { position: absolute; white-space: pre; font-size: 12px; line-height: 1.2; } .pdf-page-background { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 1; } .pdf-span { display: inline; vertical-align: baseline; } .reflow-image { display: block; max-width: 100%; height: auto; margin: 1rem auto; } .reflow-paragraph { margin: 0 0 .75rem; line-height: 1.45; } .reflow-field { display: block; margin: .75rem 0; color: #17232b; } .reflow-field input, .reflow-field select { margin-left: .5rem; padding: .35rem; } .pdf-widget { position: absolute; z-index: 4; box-sizing: border-box; font: inherit; color: #111; background: rgba(255,255,255,.88); border: 1px solid #4d6670; padding: 2px 4px; } .pdf-checkbox, .pdf-radio { padding: 0; accent-color: #0c7770; background: rgba(255,255,255,.95); } .pdf-select { padding: 0 2px; } .pdf-media { z-index: 5; background: rgba(255,255,255,.95); }"
     output = BytesIO()
     with ZipFile(output, "w") as archive:
         archive.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
@@ -424,6 +481,10 @@ def render_reflow_page(page: dict[str, object], index: int) -> tuple[str, list[t
     if azure_lines:
         for line_index, line in enumerate(azure_lines):
             markup.append(f'<p class="reflow-paragraph" id="page-{index}-line-{line_index}">{escape(str(line["text"]))}</p>')
+    elif str(page.get("text", "")).strip():
+        for line in str(page["text"]).splitlines():
+            if line.strip():
+                markup.append(f'<p class="reflow-paragraph">{escape(line)}</p>')
     for block_index, block in enumerate(page["blocks"]):
         if block["type"] == "image":
             image_name = f"OEBPS/images/page-{index}-{block_index}.{block['ext']}"
@@ -431,31 +492,34 @@ def render_reflow_page(page: dict[str, object], index: int) -> tuple[str, list[t
             markup.append(f'<img class="reflow-image" src="images/page-{index}-{block_index}.{block["ext"]}" alt="Page {index} image"/>')
         elif block["type"] == "widget":
             markup.append(render_reflow_widget(block))
-        elif block["type"] == "text" and not azure_lines:
-            for line_index, line in enumerate(block["lines"]):
-                spans = []
-                for span in line["spans"]:
-                    color = int(span["color"])
-                    rgb = f"#{(color >> 16) & 255:02x}{(color >> 8) & 255:02x}{color & 255:02x}"
-                    flags = int(span["flags"])
-                    weight = "700" if flags & 16 else "400"
-                    italic = "italic" if flags & 2 else "normal"
-                    spans.append(f'<span class="pdf-span" id="page-{index}-line-{line_index}" style="font-family:{escape(str(span["font"]))},sans-serif;font-size:{float(span["size"]):.2f}px;color:{rgb};font-weight:{weight};font-style:{italic};">{escape(str(span["text"]))}</span>')
-                markup.append(f'<p class="reflow-paragraph">{"".join(spans)}</p>')
+        elif block["type"] == "text":
+            continue
     if not markup:
         markup.append('<p class="reflow-paragraph">No extractable text on this page.</p>')
     return "".join(markup), images
 
 
 def render_fixed_accessibility_layer(page: dict[str, object], index: int) -> str:
-    paragraphs: list[str] = []
-    for block in page["blocks"]:
-        if block["type"] != "text":
-            continue
-        for line in block["lines"]:
-            text = "".join(str(span["text"]) for span in line["spans"])
-            if text.strip():
-                paragraphs.append(f"<p>{escape(text)}</p>")
+    azure_lines = page.get("azure_lines")
+    if azure_lines:
+        width = float(page["width"])
+        height = float(page["height"])
+        line_markup = []
+        for line_index, line in enumerate(azure_lines):
+            polygon = line.get("polygon", [])
+            if len(polygon) >= 8:
+                left = min(float(polygon[i]) for i in range(0, len(polygon), 2)) / float(page.get("azure_width", width)) * width
+                top = min(float(polygon[i]) for i in range(1, len(polygon), 2)) / float(page.get("azure_height", height)) * height
+                line_markup.append(f'<div class="ocr-line" id="page-{index}-line-{line_index}" style="left:{left:.2f}px;top:{top:.2f}px;">{escape(str(line["text"]))}</div>')
+            if line_markup:
+                return f'<div id="page-{index}-text" class="page-text ocr-text-layer" aria-label="OCR text for page {index}">{"".join(line_markup)}</div>'
+            content = "".join(f'<p>{escape(str(line["text"]))}</p>' for line in azure_lines if str(line["text"]).strip())
+            return f'<div id="page-{index}-text" class="page-text accessibility-text" aria-label="OCR text for page {index}">{content}</div>'
+    paragraphs = [
+        f"<p>{escape(line)}</p>"
+        for line in str(page.get("text", "")).splitlines()
+        if line.strip()
+    ]
     content = "".join(paragraphs) or "<p>No extractable text on this page.</p>"
     return f'<div id="page-{index}-text" class="page-text accessibility-text" aria-label="Extracted text for page {index}">{content}</div>'
 
@@ -496,7 +560,7 @@ def render_media(media: list[dict[str, object]], index: int, width: float, heigh
     return "".join(markup), files
 
 
-def render_page(page: dict[str, object], index: int, width: float, height: float, rotation: int) -> tuple[str, list[tuple[str, bytes]]]:
+def render_page(page: dict[str, object], index: int, width: float, height: float, rotation: int, include_text: bool = True) -> tuple[str, list[tuple[str, bytes]]]:
     markup: list[str] = []
     images: list[tuple[str, bytes]] = []
     for block_index, block in enumerate(page["blocks"]):
@@ -511,6 +575,8 @@ def render_page(page: dict[str, object], index: int, width: float, height: float
             continue
         if block["type"] == "widget":
             markup.append(render_widget(block, left, top, block_width, block_height))
+            continue
+        if not include_text:
             continue
         for line_index, line in enumerate(block["lines"]):
             line_left, line_top, line_right, line_bottom = transform_bbox(line["bbox"], width, height, rotation)

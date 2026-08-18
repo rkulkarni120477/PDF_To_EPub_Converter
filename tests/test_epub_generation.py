@@ -3,10 +3,13 @@ import sys
 import unittest
 import zipfile
 import xml.etree.ElementTree as ElementTree
+import pymupdf
+import cv2
+import numpy as np
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, "services/api-gateway")
-from app.main import AzureExtractionError, build_epub, extract_with_azure_di, merge_azure_text
+from app.main import AzureExtractionError, build_epub, extract_pdf_pages, extract_with_azure_di, merge_azure_text, remove_ocr_text_from_background
 
 
 class EpubGenerationTests(unittest.TestCase):
@@ -173,6 +176,62 @@ class EpubGenerationTests(unittest.TestCase):
         self.assertEqual(call.kwargs["content_type"], "application/pdf")
         self.assertEqual(call.kwargs["body"].read(), b"%PDF-test")
         self.assertEqual(pages[0]["text"], "Azure line")
+
+    @patch("app.main.synthesize_speech", return_value=(b"audio", 1.0))
+    def test_complete_pdf_text_is_written_to_oebps_html(self, _speech):
+        document = pymupdf.open()
+        page = document.new_page()
+        page.insert_text((40, 60), "First complete line")
+        page.insert_text((40, 90), "Second complete line")
+        source = document.tobytes()
+        document.close()
+
+        pages = extract_pdf_pages(source)
+        with zipfile.ZipFile(io.BytesIO(build_epub("Complete text", pages, "reflowable"))) as archive:
+            html = archive.read("OEBPS/page-1.xhtml").decode("utf-8")
+
+        self.assertIn("First complete line", html)
+        self.assertIn("Second complete line", html)
+
+    @patch("app.main.synthesize_speech", return_value=(b"audio", 1.0))
+    def test_background_image_ocr_text_is_written_to_fixed_html(self, _speech):
+        page = self._page("OCR text from background image")
+        page["azure_lines"] = [{"text": "OCR text from background image", "spans": []}]
+        page["background_image_text"] = "OCR text from background image"
+
+        with zipfile.ZipFile(io.BytesIO(build_epub("Image OCR", [page], "fixed"))) as archive:
+            html = archive.read("OEBPS/page-1.xhtml").decode("utf-8")
+
+        self.assertIn("OCR text from background image", html)
+        self.assertIn("class=\"page-text accessibility-text\"", html)
+
+    def test_ocr_polygon_removes_background_text_pixels(self):
+        image = np.full((100, 200, 3), 255, dtype=np.uint8)
+        cv2.putText(image, "TEXT", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 3)
+        success, encoded = cv2.imencode(".png", image)
+        self.assertTrue(success)
+        cleaned = remove_ocr_text_from_background(
+            encoded.tobytes(), [{"polygon": [25, 35, 90, 35, 90, 70, 25, 70]}], 100, 50
+        )
+        cleaned_image = cv2.imdecode(np.frombuffer(cleaned, dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertGreater(int(np.mean(cleaned_image[35:70, 50:90])), 180)
+
+    @patch("app.main.synthesize_speech", return_value=(b"audio", 1.0))
+    def test_fixed_html_keeps_extracted_image_reference(self, _speech):
+        page = self._page("Page with image")
+        page["blocks"].append({
+            "type": "image",
+            "bbox": (80, 120, 240, 240),
+            "data": b"png-bytes",
+            "ext": "png",
+        })
+
+        with zipfile.ZipFile(io.BytesIO(build_epub("Image page", [page], "fixed"))) as archive:
+            names = archive.namelist()
+            html = archive.read("OEBPS/page-1.xhtml").decode("utf-8")
+
+        self.assertIn("OEBPS/images/page-1-1.png", names)
+        self.assertIn('src="images/page-1-1.png"', html)
 
     @staticmethod
     def _page(text: str) -> dict[str, object]:

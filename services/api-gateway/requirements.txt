@@ -6,3 +6,4 @@ pyttsx3
 PyMuPDF
 azure-ai-documentintelligence
 python-dotenv
+opencv-python-headless
