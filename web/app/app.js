@@ -6,21 +6,30 @@ const dropText = document.querySelector('#dropText');
 const sourceFile = document.querySelector('#sourceFile');
 const convertButton = document.querySelector('#convertButton');
 const downloadLink = document.querySelector('#downloadLink');
+const previewButton = document.querySelector('#previewButton');
 const toast = document.querySelector('#toast');
 const conversionStatus = document.querySelector('#conversionStatus');
 const conversionStatusFoot = document.querySelector('#conversionStatusFoot');
+const conversionFailureReason = document.querySelector('#conversionFailureReason');
 const currentSource = document.querySelector('#currentSource');
 const currentSourceFoot = document.querySelector('#currentSourceFoot');
 const outputProfile = document.querySelector('#outputProfile');
 const outputProfileFoot = document.querySelector('#outputProfileFoot');
+const layoutSelect = document.querySelector('#layoutSelect');
+const useAzureDI = document.querySelector('#useAzureDI');
+const runAccessibilityChecks = document.querySelector('#runAccessibilityChecks');
 const activityList = document.querySelector('#activityList');
+const liveFailure = document.querySelector('#liveFailure');
+const liveFailureDetails = document.querySelector('#liveFailureDetails');
 const libraryList = document.querySelector('#libraryList');
 const libraryCount = document.querySelector('#libraryCount');
 const settingsSaved = document.querySelector('#settingsSaved');
 const clearStorageButton = document.querySelector('#clearStorageButton');
+const clearLibraryButton = document.querySelector('#clearLibraryButton');
 const apiBaseUrl = 'http://127.0.0.1:8000';
 let selectedFile = null;
 const activityStorageKey = 'academian-conversion-activity';
+const toggleStorageKey = 'academian-toggle-settings';
 
 function showToast(message) {
   toast.textContent = message;
@@ -40,8 +49,8 @@ function renderActivity() {
   }
   activityList.innerHTML = activities.map((activity) => `
     <div class="activity-item">
-      <span class="activity-dot green"></span>
-      <div><strong>Conversion completed</strong><p>${activity.title}.epub</p><small>${formatTime(activity.createdAt)} · ${activity.pages} page${activity.pages === 1 ? '' : 's'}</small></div>
+      <span class="activity-dot ${activity.status === 'failed' ? 'red' : 'green'}"></span>
+      <div><strong>${activity.status === 'failed' ? 'Conversion failed' : 'Conversion completed'}</strong><p>${activity.title}${activity.status === 'failed' ? '' : '.epub'}</p><small>${formatTime(activity.createdAt)}${activity.status === 'failed' ? ` · ${activity.error}` : ` · ${activity.pages} page${activity.pages === 1 ? '' : 's'}`}</small></div>
     </div>`).join('');
 }
 
@@ -53,16 +62,36 @@ function renderLibrary() {
     return;
   }
   libraryList.innerHTML = activities.map((activity) => `
-    <article class="library-card"><span class="epub-badge">ePub</span><div><strong>${activity.title}.epub</strong><span>${activity.pages} page${activity.pages === 1 ? '' : 's'} · ${formatTime(activity.createdAt)}</span></div><a href="${activity.downloadUrl || '#'}" ${activity.downloadUrl ? 'download' : ''} aria-label="Download ${activity.title}">Download</a></article>`).join('');
+    <article class="library-card"><span class="epub-badge">ePub</span><div><strong>${activity.title}.epub</strong><span>${activity.pages} page${activity.pages === 1 ? '' : 's'} · ${formatTime(activity.createdAt)}</span></div><div class="library-links"><a href="${activity.downloadUrl || '#'}" ${activity.downloadUrl ? 'download' : ''} aria-label="Download ${activity.title}">Download file</a></div></article>`).join('');
 }
 
 function recordConversion(result) {
   const activities = JSON.parse(localStorage.getItem(activityStorageKey) || '[]');
   activities.unshift({ title: result.title, pages: result.pages, createdAt: Date.now() });
   activities[0].downloadUrl = `${apiBaseUrl}${result.download_url}`;
+  activities[0].previewUrl = `${apiBaseUrl}/api/v1/previews/${result.conversion_id}`;
   localStorage.setItem(activityStorageKey, JSON.stringify(activities.slice(0, 10)));
   renderActivity();
   renderLibrary();
+  liveFailure.hidden = true;
+}
+
+function recordConversionFailure(error) {
+  const filename = selectedFile?.name || 'PDF conversion';
+  liveFailureDetails.textContent = `${filename}: ${error}`;
+  liveFailure.hidden = false;
+  const activities = JSON.parse(localStorage.getItem(activityStorageKey) || '[]');
+  activities.unshift({
+    title: filename,
+    status: 'failed',
+    error,
+    createdAt: Date.now(),
+  });
+  localStorage.setItem(activityStorageKey, JSON.stringify(activities.slice(0, 10)));
+  renderActivity();
+  const failedActivity = activityList.querySelector('.activity-item');
+  failedActivity?.classList.add('activity-failed-highlight');
+  document.querySelector('#activity').scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 document.querySelectorAll('.nav-item, .brand').forEach((link) => link.addEventListener('click', () => {
@@ -71,15 +100,51 @@ document.querySelectorAll('.nav-item, .brand').forEach((link) => link.addEventLi
 renderActivity();
 renderLibrary();
 
+const savedToggles = JSON.parse(localStorage.getItem(toggleStorageKey) || '{}');
+if (savedToggles.useAzureDI !== undefined) useAzureDI.checked = savedToggles.useAzureDI;
+if (savedToggles.runAccessibilityChecks !== undefined) runAccessibilityChecks.checked = savedToggles.runAccessibilityChecks;
+[useAzureDI, runAccessibilityChecks].forEach((toggle) => toggle.addEventListener('change', () => {
+  localStorage.setItem(toggleStorageKey, JSON.stringify({
+    useAzureDI: useAzureDI.checked,
+    runAccessibilityChecks: runAccessibilityChecks.checked,
+  }));
+}));
+
 clearStorageButton.addEventListener('click', () => {
   if (!window.confirm('Clear saved conversions and workspace settings from this browser?')) return;
   localStorage.removeItem(activityStorageKey);
   localStorage.removeItem('academian-settings');
+    localStorage.removeItem(toggleStorageKey);
+    useAzureDI.checked = false;
+    runAccessibilityChecks.checked = true;
   renderActivity();
   renderLibrary();
   settingsSaved.textContent = 'Cleared';
   showToast('Local storage cleared.');
   window.setTimeout(() => { settingsSaved.textContent = 'Saved locally'; }, 1800);
+});
+
+clearLibraryButton.addEventListener('click', async () => {
+  const activities = JSON.parse(localStorage.getItem(activityStorageKey) || '[]');
+  if (!activities.length) {
+    showToast('Library is already empty.');
+    return;
+  }
+  if (!window.confirm('Delete all generated ePub files from the Library?')) return;
+  clearLibraryButton.disabled = true;
+  try {
+    const response = await fetch(`${apiBaseUrl}/api/v1/conversions`, { method: 'DELETE' });
+    const result = await response.json();
+    if (!response.ok || result.status !== 'cleared') throw new Error('Could not clear the Library.');
+    localStorage.removeItem(activityStorageKey);
+    renderActivity();
+    renderLibrary();
+    showToast(`Deleted ${result.deleted} generated file${result.deleted === 1 ? '' : 's'}.`);
+  } catch (error) {
+    showToast(error.message);
+  } finally {
+    clearLibraryButton.disabled = false;
+  }
 });
 
 const settingsInputs = ['defaultOutput', 'defaultLayout', 'defaultDirection', 'defaultAccessibility'].map((id) => document.querySelector(`#${id}`));
@@ -107,6 +172,9 @@ function setFile(file) {
     return;
   }
   selectedFile = file;
+  liveFailure.hidden = true;
+  conversionFailureReason.hidden = true;
+  conversionFailureReason.textContent = '';
   downloadLink.hidden = true;
   dropTitle.textContent = file.name;
   dropText.textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB ready to process`;
@@ -146,10 +214,14 @@ document.querySelector('.remove-button').addEventListener('click', () => {
   currentSourceFoot.textContent = 'Choose a source document to begin';
   conversionStatus.innerHTML = '<i></i>Ready to convert';
   conversionStatusFoot.textContent = 'No conversion run yet';
+  conversionFailureReason.hidden = true;
+  conversionFailureReason.textContent = '';
   showToast('Source document removed.');
 });
 
-document.querySelector('#newProjectButton').addEventListener('click', () => showToast('New project flow is ready for wiring to the API gateway.'));
+previewButton.addEventListener('click', () => {
+  if (previewButton.dataset.url) window.open(previewButton.dataset.url, '_blank', 'noopener');
+});
 convertButton.addEventListener('click', () => {
   if (!selectedFile) {
     showToast('Choose a PDF before starting conversion.');
@@ -161,21 +233,34 @@ convertButton.addEventListener('click', () => {
   conversionStatusFoot.textContent = 'Preserving pages, forms, images, and Read Aloud audio';
   const formData = new FormData();
   formData.append('file', selectedFile);
+  formData.append('layout', layoutSelect.value);
+  formData.append('use_azure_di', useAzureDI.checked ? 'true' : 'false');
+  const configurationCheck = useAzureDI.checked
+    ? fetch(`${apiBaseUrl}/api/v1/capabilities`).then((response) => response.json()).then((capabilities) => {
+      if (!capabilities.azure_document_intelligence_configured) {
+        throw new Error('Azure Document Intelligence is not configured. Set AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT and AZURE_DOCUMENT_INTELLIGENCE_KEY for the gateway.');
+      }
+    })
+    : Promise.resolve();
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), 190000);
-  fetch(`${apiBaseUrl}/api/v1/conversions`, { method: 'POST', body: formData, signal: controller.signal })
+  configurationCheck.then(() => fetch(`${apiBaseUrl}/api/v1/conversions`, { method: 'POST', body: formData, signal: controller.signal }))
     .then(async (response) => {
       const result = await response.json();
-      if (!response.ok || result.status !== 'completed') throw new Error(result.reason || 'Conversion failed.');
+          if (!response.ok || result.status !== 'completed') throw new Error(result.detail || result.reason || 'Conversion failed.');
       downloadLink.href = `${apiBaseUrl}${result.download_url}`;
       downloadLink.download = `${result.title}.epub`;
       downloadLink.hidden = false;
+      previewButton.dataset.url = `${apiBaseUrl}/api/v1/previews/${result.conversion_id}`;
+      previewButton.hidden = false;
       conversionStatus.innerHTML = '<i></i>Conversion complete';
       conversionStatusFoot.textContent = `${result.pages} page${result.pages === 1 ? '' : 's'} processed · ${formatTime(Date.now())}`;
+      conversionFailureReason.hidden = true;
+      conversionFailureReason.textContent = '';
       currentSource.textContent = selectedFile.name;
       currentSourceFoot.textContent = `${(selectedFile.size / 1024 / 1024).toFixed(1)} MB · Converted successfully`;
-      outputProfile.textContent = 'ePub 3.2';
-      outputProfileFoot.textContent = 'Read Aloud + fixed layout';
+      outputProfile.textContent = result.layout === 'fixed' ? 'ePub 3.2 fixed' : 'ePub 3.2 reflowable';
+      outputProfileFoot.textContent = `${result.azure_document_intelligence ? 'Azure DI + ' : ''}Read Aloud + extracted HTML content`;
       recordConversion(result);
       showToast(`Created ePub from ${result.pages} page(s).`);
     })
@@ -183,6 +268,9 @@ convertButton.addEventListener('click', () => {
       const message = error.name === 'AbortError' ? 'Conversion timed out. Try a smaller PDF.' : error.message;
       conversionStatus.innerHTML = '<i></i>Conversion failed';
       conversionStatusFoot.textContent = message;
+      conversionFailureReason.textContent = `Reason: ${message}`;
+      conversionFailureReason.hidden = false;
+      recordConversionFailure(message);
       showToast(message);
     })
     .finally(() => {

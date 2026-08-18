@@ -4,3 +4,5 @@ pypdf
 python-multipart
 pyttsx3
 PyMuPDF
+azure-ai-documentintelligence
+python-dotenv
