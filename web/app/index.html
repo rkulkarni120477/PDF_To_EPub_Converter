@@ -3,15 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Folio Foundry | PDF to ePub</title>
+  <title>Academian | PDF to ePub</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <a class="brand" href="#" aria-label="Folio Foundry home">
-        <span class="brand-mark">F</span>
-        <span><strong>Folio</strong><small>FOUNDRY</small></span>
+      <a class="brand" href="#workspace" aria-label="Academian home">
+        <span class="brand-mark">A</span>
+        <span><strong>Academian</strong><small>LEARNING STUDIO</small></span>
       </a>
       <nav class="primary-nav" aria-label="Primary navigation">
         <a class="nav-item active" href="#workspace"><span class="nav-icon">+</span>Workspace</a>
@@ -23,6 +23,7 @@
         <div class="storage-label"><span>Storage</span><span>68%</span></div>
         <div class="storage-track"><span></span></div>
         <p>6.8 GB of 10 GB used</p>
+        <button class="clear-storage-button" id="clearStorageButton" type="button">Clear local storage</button>
         <a class="nav-item" href="#settings"><span class="nav-icon">*</span>Settings</a>
         <div class="profile"><span class="avatar">RS</span><span><strong>Rahul S.</strong><small>Administrator</small></span><span class="chevron">v</span></div>
       </div>
@@ -40,9 +41,9 @@
       </section>
 
       <section class="stats-row" aria-label="Workspace statistics">
-        <article class="stat-card"><span class="stat-label">Conversion status</span><strong class="status-text"><i></i>Ready to convert</strong><span class="stat-foot">Last run 2 hours ago</span></article>
-        <article class="stat-card"><span class="stat-label">Current source</span><strong>spring-catalogue.pdf</strong><span class="stat-foot">42.8 MB / 128 pages</span></article>
-        <article class="stat-card"><span class="stat-label">Output profile</span><strong>ePub 3.2</strong><span class="stat-foot">Accessible + reflowable</span></article>
+        <article class="stat-card"><span class="stat-label">Conversion status</span><strong class="status-text" id="conversionStatus"><i></i>Ready to convert</strong><span class="stat-foot" id="conversionStatusFoot">No conversion run yet</span></article>
+        <article class="stat-card"><span class="stat-label">Current source</span><strong id="currentSource">No PDF selected</strong><span class="stat-foot" id="currentSourceFoot">Choose a source document to begin</span></article>
+        <article class="stat-card"><span class="stat-label">Output profile</span><strong id="outputProfile">ePub 3.2</strong><span class="stat-foot" id="outputProfileFoot">Accessible + fixed layout</span></article>
       </section>
 
       <section class="workspace-grid">
@@ -62,10 +63,22 @@
 
         <aside class="secondary-column">
           <article class="panel review-panel"><div class="panel-heading compact"><div><span class="section-number">03</span><div><h2>Review & convert</h2><p>Everything looks ready.</p></div></div></div><div class="check-list"><div><span class="check">ok</span><span>Source document added</span></div><div><span class="check">ok</span><span>Metadata detected</span></div><div><span class="check">ok</span><span>Output profile selected</span></div></div><button class="convert-button" id="convertButton">Start conversion <span>-&gt;</span></button><a class="download-link" id="downloadLink" hidden>Download ePub <span>-&gt;</span></a><p class="convert-note">Estimated time: 2-4 minutes</p></article>
-          <article class="panel activity-panel" id="activity"><div class="panel-heading compact"><div><h2>Recent activity</h2><a href="#activity">View all</a></div></div><div class="activity-item"><span class="activity-dot green"></span><div><strong>Conversion completed</strong><p>Winter catalogue.epub</p><small>Today, 09:42</small></div></div><div class="activity-item"><span class="activity-dot blue"></span><div><strong>New project created</strong><p>Spring Catalogue 2026</p><small>Today, 09:18</small></div></div><div class="activity-item"><span class="activity-dot amber"></span><div><strong>Review requested</strong><p>Brand guidelines.pdf</p><small>Yesterday, 16:04</small></div></div></article>
+          <article class="panel activity-panel" id="activity"><div class="panel-heading compact"><div><h2>Recent activity</h2><a href="#activity">View all</a></div></div><div id="activityList"><div class="empty-activity">No conversions yet. Your latest activity will appear here.</div></div></article>
         </aside>
       </section>
-      <footer><span>Folio Foundry</span><span>All systems operational</span><span>v0.1 workspace preview</span></footer>
+      <section class="nav-target library-section" id="library">
+        <div class="section-toolbar"><div><p class="eyebrow">YOUR CATALOGUE</p><h2>Library</h2><p>Generated ePub files stay available in this workspace.</p></div><span class="section-count" id="libraryCount">0 files</span></div>
+        <div class="library-grid" id="libraryList"><div class="empty-state"><strong>Your library is empty</strong><span>Complete a conversion to see downloadable ePub files here.</span></div></div>
+      </section>
+      <section class="nav-target team-section" id="team">
+        <div class="section-toolbar"><div><p class="eyebrow">WORKSPACE ACCESS</p><h2>Team</h2><p>People who can review and manage this catalogue.</p></div><button class="outline-button" id="inviteButton">+ Invite member</button></div>
+        <div class="member-grid"><div class="member-card"><span class="member-avatar coral">RS</span><div><strong>Rahul Sudhakar</strong><span>Administrator · You</span></div><b>Owner</b></div><div class="member-card"><span class="member-avatar teal">AM</span><div><strong>Alex Morgan</strong><span>Editorial reviewer</span></div><b>Reviewer</b></div><div class="member-card"><span class="member-avatar gold">JP</span><div><strong>Jamie Patel</strong><span>Publishing partner</span></div><b>Editor</b></div></div>
+      </section>
+      <section class="nav-target settings-section" id="settings">
+        <div class="section-toolbar"><div><p class="eyebrow">WORKSPACE PREFERENCES</p><h2>Settings</h2><p>Defaults used for new conversion jobs.</p></div><span class="saved-label" id="settingsSaved">Saved locally</span></div>
+        <div class="settings-grid settings-grid-wide"><label>Default output<select id="defaultOutput"><option>ePub 3.2</option><option>ePub 3.0</option></select></label><label>Default layout<select id="defaultLayout"><option>Fixed layout</option><option>Reflowable</option></select></label><label>Reading direction<select id="defaultDirection"><option>Left to right</option><option>Right to left</option></select></label><label class="setting-check"><input id="defaultAccessibility" type="checkbox" checked><span><strong>Accessibility checks</strong><small>Validate reading order, contrast, and alt text.</small></span></label></div>
+      </section>
+      <footer><span>Academian</span><span>All systems operational</span><span>v0.1 workspace preview</span></footer>
     </main>
   </div>
   <div class="toast" id="toast" role="status"></div>

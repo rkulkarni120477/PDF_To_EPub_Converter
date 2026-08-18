@@ -7,14 +7,99 @@ const sourceFile = document.querySelector('#sourceFile');
 const convertButton = document.querySelector('#convertButton');
 const downloadLink = document.querySelector('#downloadLink');
 const toast = document.querySelector('#toast');
+const conversionStatus = document.querySelector('#conversionStatus');
+const conversionStatusFoot = document.querySelector('#conversionStatusFoot');
+const currentSource = document.querySelector('#currentSource');
+const currentSourceFoot = document.querySelector('#currentSourceFoot');
+const outputProfile = document.querySelector('#outputProfile');
+const outputProfileFoot = document.querySelector('#outputProfileFoot');
+const activityList = document.querySelector('#activityList');
+const libraryList = document.querySelector('#libraryList');
+const libraryCount = document.querySelector('#libraryCount');
+const settingsSaved = document.querySelector('#settingsSaved');
+const clearStorageButton = document.querySelector('#clearStorageButton');
 const apiBaseUrl = 'http://127.0.0.1:8000';
 let selectedFile = null;
+const activityStorageKey = 'academian-conversion-activity';
 
 function showToast(message) {
   toast.textContent = message;
   toast.classList.add('show');
   window.setTimeout(() => toast.classList.remove('show'), 2800);
 }
+
+function formatTime(timestamp) {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(timestamp));
+}
+
+function renderActivity() {
+  const activities = JSON.parse(localStorage.getItem(activityStorageKey) || '[]');
+  if (!activities.length) {
+    activityList.innerHTML = '<div class="empty-activity">No conversions yet. Your latest activity will appear here.</div>';
+    return;
+  }
+  activityList.innerHTML = activities.map((activity) => `
+    <div class="activity-item">
+      <span class="activity-dot green"></span>
+      <div><strong>Conversion completed</strong><p>${activity.title}.epub</p><small>${formatTime(activity.createdAt)} · ${activity.pages} page${activity.pages === 1 ? '' : 's'}</small></div>
+    </div>`).join('');
+}
+
+function renderLibrary() {
+  const activities = JSON.parse(localStorage.getItem(activityStorageKey) || '[]');
+  libraryCount.textContent = `${activities.length} file${activities.length === 1 ? '' : 's'}`;
+  if (!activities.length) {
+    libraryList.innerHTML = '<div class="empty-state"><strong>Your library is empty</strong><span>Complete a conversion to see downloadable ePub files here.</span></div>';
+    return;
+  }
+  libraryList.innerHTML = activities.map((activity) => `
+    <article class="library-card"><span class="epub-badge">ePub</span><div><strong>${activity.title}.epub</strong><span>${activity.pages} page${activity.pages === 1 ? '' : 's'} · ${formatTime(activity.createdAt)}</span></div><a href="${activity.downloadUrl || '#'}" ${activity.downloadUrl ? 'download' : ''} aria-label="Download ${activity.title}">Download</a></article>`).join('');
+}
+
+function recordConversion(result) {
+  const activities = JSON.parse(localStorage.getItem(activityStorageKey) || '[]');
+  activities.unshift({ title: result.title, pages: result.pages, createdAt: Date.now() });
+  activities[0].downloadUrl = `${apiBaseUrl}${result.download_url}`;
+  localStorage.setItem(activityStorageKey, JSON.stringify(activities.slice(0, 10)));
+  renderActivity();
+  renderLibrary();
+}
+
+document.querySelectorAll('.nav-item, .brand').forEach((link) => link.addEventListener('click', () => {
+  document.querySelectorAll('.primary-nav .nav-item').forEach((item) => item.classList.toggle('active', item.getAttribute('href') === link.getAttribute('href')));
+}));
+renderActivity();
+renderLibrary();
+
+clearStorageButton.addEventListener('click', () => {
+  if (!window.confirm('Clear saved conversions and workspace settings from this browser?')) return;
+  localStorage.removeItem(activityStorageKey);
+  localStorage.removeItem('academian-settings');
+  renderActivity();
+  renderLibrary();
+  settingsSaved.textContent = 'Cleared';
+  showToast('Local storage cleared.');
+  window.setTimeout(() => { settingsSaved.textContent = 'Saved locally'; }, 1800);
+});
+
+const settingsInputs = ['defaultOutput', 'defaultLayout', 'defaultDirection', 'defaultAccessibility'].map((id) => document.querySelector(`#${id}`));
+const savedSettings = JSON.parse(localStorage.getItem('academian-settings') || '{}');
+settingsInputs.forEach((input) => {
+  if (!input) return;
+  if (savedSettings[input.id] !== undefined) {
+    if (input.type === 'checkbox') input.checked = savedSettings[input.id];
+    else input.value = savedSettings[input.id];
+  }
+  input.addEventListener('change', () => {
+    const settings = JSON.parse(localStorage.getItem('academian-settings') || '{}');
+    settings[input.id] = input.type === 'checkbox' ? input.checked : input.value;
+    localStorage.setItem('academian-settings', JSON.stringify(settings));
+    settingsSaved.textContent = 'Saved just now';
+    window.setTimeout(() => { settingsSaved.textContent = 'Saved locally'; }, 1800);
+  });
+});
+
+document.querySelector('#inviteButton').addEventListener('click', () => showToast('Invite link copied for your review team.'));
 
 function setFile(file) {
   if (!file || (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf'))) {
@@ -27,6 +112,10 @@ function setFile(file) {
   dropText.textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB ready to process`;
   sourceFile.querySelector('strong').textContent = file.name;
   sourceFile.querySelector('span:not(.pdf-badge)').textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB · Added just now`;
+  currentSource.textContent = file.name;
+  currentSourceFoot.textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB · Ready for conversion`;
+  conversionStatus.innerHTML = '<i></i>Ready to convert';
+  conversionStatusFoot.textContent = 'Source document selected';
   showToast('Source document added.');
 }
 
@@ -53,6 +142,10 @@ document.querySelector('.remove-button').addEventListener('click', () => {
   dropText.textContent = 'or browse files from your computer';
   sourceFile.querySelector('strong').textContent = 'spring-catalogue.pdf';
   sourceFile.querySelector('span:not(.pdf-badge)').textContent = '42.8 MB · Added today';
+  currentSource.textContent = 'No PDF selected';
+  currentSourceFoot.textContent = 'Choose a source document to begin';
+  conversionStatus.innerHTML = '<i></i>Ready to convert';
+  conversionStatusFoot.textContent = 'No conversion run yet';
   showToast('Source document removed.');
 });
 
@@ -63,21 +156,37 @@ convertButton.addEventListener('click', () => {
     return;
   }
   convertButton.disabled = true;
-  convertButton.textContent = 'Preparing conversion...';
+  convertButton.textContent = 'Converting PDF...';
+  conversionStatus.innerHTML = '<i></i>Conversion in progress';
+  conversionStatusFoot.textContent = 'Preserving pages, forms, images, and Read Aloud audio';
   const formData = new FormData();
   formData.append('file', selectedFile);
-  fetch(`${apiBaseUrl}/api/v1/conversions`, { method: 'POST', body: formData })
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 190000);
+  fetch(`${apiBaseUrl}/api/v1/conversions`, { method: 'POST', body: formData, signal: controller.signal })
     .then(async (response) => {
       const result = await response.json();
       if (!response.ok || result.status !== 'completed') throw new Error(result.reason || 'Conversion failed.');
       downloadLink.href = `${apiBaseUrl}${result.download_url}`;
       downloadLink.download = `${result.title}.epub`;
       downloadLink.hidden = false;
-      document.querySelector('.status-text').innerHTML = '<i></i>Conversion complete';
+      conversionStatus.innerHTML = '<i></i>Conversion complete';
+      conversionStatusFoot.textContent = `${result.pages} page${result.pages === 1 ? '' : 's'} processed · ${formatTime(Date.now())}`;
+      currentSource.textContent = selectedFile.name;
+      currentSourceFoot.textContent = `${(selectedFile.size / 1024 / 1024).toFixed(1)} MB · Converted successfully`;
+      outputProfile.textContent = 'ePub 3.2';
+      outputProfileFoot.textContent = 'Read Aloud + fixed layout';
+      recordConversion(result);
       showToast(`Created ePub from ${result.pages} page(s).`);
     })
-    .catch((error) => showToast(error.message))
+    .catch((error) => {
+      const message = error.name === 'AbortError' ? 'Conversion timed out. Try a smaller PDF.' : error.message;
+      conversionStatus.innerHTML = '<i></i>Conversion failed';
+      conversionStatusFoot.textContent = message;
+      showToast(message);
+    })
     .finally(() => {
+      window.clearTimeout(timeoutId);
       convertButton.disabled = false;
       convertButton.innerHTML = 'Start conversion <span>-></span>';
     });

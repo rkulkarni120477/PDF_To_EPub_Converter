@@ -18,6 +18,7 @@ class EpubGenerationTests(unittest.TestCase):
                 "rotation": 0,
                 "text": "Heading paragraph",
                 "page_image": b"page image",
+                "media": [{"name": "sample.mp3", "data": b"audio bytes", "mime": "audio/mpeg", "kind": "audio"}],
                 "blocks": [
                     {
                         "type": "text",
@@ -75,6 +76,9 @@ class EpubGenerationTests(unittest.TestCase):
         self.assertGreaterEqual(page.count('class="pdf-span"'), 2)
         self.assertIn("text src=", overlay)
         self.assertIn("audio src=", overlay)
+        self.assertTrue(any(name.startswith("OEBPS/media/") and name.endswith("sample.mp3") for name in names))
+        self.assertIn("<audio", page)
+        self.assertIn("audio/mpeg", opf)
 
     @patch("app.main.synthesize_speech", return_value=(b"audio", 1.0))
     def test_form_widgets_are_rendered(self, _speech):

@@ -1,3 +1,4 @@
+import asyncio
 from html import escape
 from io import BytesIO
 from pathlib import Path
@@ -71,15 +72,19 @@ async def convert_pdf(file: UploadFile | None = File(None)) -> dict[str, str | i
 
     source = await file.read()
     try:
-        pages = extract_pdf_pages(source)
+        pages = await asyncio.wait_for(asyncio.to_thread(extract_pdf_pages, source), timeout=60)
     except (fitz.FileDataError, ValueError) as error:
         raise HTTPException(status_code=400, detail="The uploaded file is not a readable PDF.") from error
+    except asyncio.TimeoutError as error:
+        raise HTTPException(status_code=504, detail="PDF layout extraction timed out.") from error
     conversion_id = uuid4().hex
     title = Path(file.filename).stem.replace("_", " ").replace("-", " ").strip() or "Converted document"
     try:
-        epub = build_epub(title, pages)
+        epub = await asyncio.wait_for(asyncio.to_thread(build_epub, title, pages), timeout=180)
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
+    except asyncio.TimeoutError as error:
+        raise HTTPException(status_code=504, detail="EPUB generation timed out. Try a smaller PDF or fewer pages.") from error
     CONVERSIONS[conversion_id] = (f"{title}.epub", epub)
     return {
         "status": "completed",
@@ -105,6 +110,7 @@ def download_conversion(conversion_id: str) -> StreamingResponse:
 def extract_pdf_pages(source: bytes) -> list[dict[str, object]]:
     document = fitz.open(stream=source, filetype="pdf")
     pages: list[dict[str, object]] = []
+    document_media = extract_document_media(document)
     try:
         for page in document:
             page_dict = page.get_text("dict")
@@ -156,6 +162,8 @@ def extract_pdf_pages(source: bytes) -> list[dict[str, object]]:
                     "choices": choices,
                     "checked": bool(widget.field_value and widget.field_value not in ("Off", "0")),
                 })
+            media = list(document_media if len(pages) == 0 else [])
+            media.extend(extract_page_media(page))
             pages.append({
                 "width": page.rect.width,
                 "height": page.rect.height,
@@ -163,10 +171,51 @@ def extract_pdf_pages(source: bytes) -> list[dict[str, object]]:
                 "blocks": blocks,
                 "text": " ".join(page_text).strip(),
                 "page_image": page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).tobytes("png"),
+                "media": media,
             })
     finally:
         document.close()
     return pages
+
+
+def extract_document_media(document: fitz.Document) -> list[dict[str, object]]:
+    media: list[dict[str, object]] = []
+    for name in document.embfile_names():
+        embedded = document.embfile_get(name)
+        data = embedded.get("file", b"") if isinstance(embedded, dict) else b""
+        if data and media_mime_type(name):
+            media.append({"name": name, "data": data, "mime": media_mime_type(name), "kind": media_kind(name)})
+    return media
+
+
+def extract_page_media(page: fitz.Page) -> list[dict[str, object]]:
+    media: list[dict[str, object]] = []
+    for annot in page.annots() or []:
+        annot_type = annot.type[0] if annot.type else 0
+        if annot_type == getattr(fitz, "PDF_ANNOT_FILE_ATTACHMENT", 17):
+            info = annot.file_info or {}
+            name = info.get("filename", f"attachment-{annot.xref}.bin")
+            data = annot.get_file().get("file", b"")
+        elif annot_type in (getattr(fitz, "PDF_ANNOT_SOUND", 18), getattr(fitz, "PDF_ANNOT_MOVIE", 19), getattr(fitz, "PDF_ANNOT_RICH_MEDIA", 20)):
+            info = annot.file_info or {}
+            name = info.get("filename", f"media-{annot.xref}.bin")
+            getter = annot.get_sound if annot_type == getattr(fitz, "PDF_ANNOT_SOUND", 18) else annot.get_file
+            result = getter()
+            data = result.get("file", b"") if isinstance(result, dict) else b""
+        else:
+            continue
+        mime = media_mime_type(name)
+        if data and mime:
+            media.append({"name": name, "data": data, "mime": mime, "kind": media_kind(name), "bbox": tuple(annot.rect)})
+    return media
+
+
+def media_mime_type(name: str) -> str | None:
+    return {"mp3": "audio/mpeg", "wav": "audio/wav", "m4a": "audio/mp4", "aac": "audio/aac", "mp4": "video/mp4", "webm": "video/webm", "mov": "video/quicktime", "avi": "video/x-msvideo"}.get(Path(name).suffix.lower().lstrip("."))
+
+
+def media_kind(name: str) -> str:
+    return "audio" if media_mime_type(name).startswith("audio/") else "video"
 
 
 def build_epub(title: str, pages: list[dict[str, object]]) -> bytes:
@@ -174,6 +223,7 @@ def build_epub(title: str, pages: list[dict[str, object]]) -> bytes:
     overlay_documents: list[tuple[str, str]] = []
     audio_files: list[tuple[str, bytes]] = []
     image_files: list[tuple[str, bytes, str]] = []
+    media_files: list[tuple[str, bytes, str]] = []
     for index, page in enumerate(pages, start=1):
         page_text = str(page["text"]).strip() or "This page did not contain extractable text."
         width = float(page["width"])
@@ -181,14 +231,16 @@ def build_epub(title: str, pages: list[dict[str, object]]) -> bytes:
         rotation = int(page["rotation"])
         page_width, page_height = (height, width) if rotation in (90, 270) else (width, height)
         markup, page_images = render_page(page, index, width, height, rotation)
+        media_markup, page_media_files = render_media(page.get("media", []), index, width, height, rotation)
         background_name = f"OEBPS/images/page-{index}-background.png"
         image_files.append((background_name, page["page_image"], "png"))
-        markup = f'<img class="pdf-page-background" src="images/page-{index}-background.png" alt="" aria-hidden="true"/>{markup}'
+        markup = f'<img class="pdf-page-background" src="images/page-{index}-background.png" alt="" aria-hidden="true"/>{markup}{media_markup}'
         page_name = f"page-{index}.xhtml"
         page_documents.append(
             (page_name, f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{escape(title)} - Page {index}</title><meta charset="utf-8"/><meta name="viewport" content="width={page_width:.0f}, height={page_height:.0f}"/><link rel="stylesheet" type="text/css" href="style.css"/></head><body><section id="page-{index}" class="page" style="width:{page_width:.2f}px;height:{page_height:.2f}px;" data-rotation="{rotation}"><div id="page-{index}-text" class="page-text">{markup}</div></section></body></html>''')
         )
         image_files.extend((name, data, Path(name).suffix.lstrip(".")) for name, data in page_images)
+        media_files.extend(page_media_files)
         audio_name = f"OEBPS/audio/page-{index}.wav"
         audio_bytes, duration = synthesize_speech(page_text)
         audio_files.append((audio_name, audio_bytes))
@@ -204,16 +256,17 @@ def build_epub(title: str, pages: list[dict[str, object]]) -> bytes:
     overlay_manifest = "".join(f'<item id="overlay-{index}" href="{name}" media-type="application/smil+xml"/>' for index, (name, _) in enumerate(overlay_documents, start=1))
     audio_manifest = "".join(f'<item id="audio-{index}" href="{name.removeprefix("OEBPS/")}" media-type="audio/wav"/>' for index, (name, _) in enumerate(audio_files, start=1))
     image_manifest = "".join(f'<item id="image-{index}" href="{name.removeprefix("OEBPS/")}" media-type="image/{extension}"/>' for index, (name, _, extension) in enumerate(image_files, start=1))
+    media_manifest = "".join(f'<item id="media-{index}" href="{name.removeprefix("OEBPS/")}" media-type="{mime}"/>' for index, (name, _, mime) in enumerate(media_files, start=1))
     spine = "".join(f'<itemref idref="page-{index}" media-overlay="overlay-{index}"/>' for index in range(1, len(page_documents) + 1))
     opf = f'''<?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="book-id">
     <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="book-id">urn:uuid:{uuid4()}</dc:identifier><dc:title>{safe_title}</dc:title><dc:language>en</dc:language><meta property="rendition:layout">pre-paginated</meta><meta property="rendition:orientation">auto</meta><meta property="rendition:spread">none</meta><meta property="media:active-class">-epub-media-overlay-active</meta></metadata>
-    <manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="style" href="style.css" media-type="text/css"/>{page_manifest}{overlay_manifest}{audio_manifest}{image_manifest}</manifest>
+    <manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="style" href="style.css" media-type="text/css"/>{page_manifest}{overlay_manifest}{audio_manifest}{image_manifest}{media_manifest}</manifest>
     <spine>{spine}</spine>
 </package>'''
     nav_items = "".join(f'<li><a href="{name}">Page {index}</a></li>' for index, (name, _) in enumerate(page_documents, start=1))
     nav = f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{safe_title}</title></head><body><nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><h1>Contents</h1><ol>{nav_items}</ol></nav></body></html>'''
-    style = ".-epub-media-overlay-active { background: #fff2a8 !important; } .page { position: relative; overflow: hidden; page-break-after: always; } .page-text { position: absolute; inset: 0; z-index: 2; } .pdf-page-background { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 1; } .pdf-text { position: absolute; white-space: pre; overflow: visible; color: transparent !important; } .pdf-span { display: inline; vertical-align: baseline; color: transparent !important; } .pdf-span.-epub-media-overlay-active { color: transparent !important; background: #fff2a8 !important; } .pdf-image { display: none; } .pdf-widget { position: absolute; z-index: 4; box-sizing: border-box; font: inherit; color: #111; background: rgba(255,255,255,.88); border: 1px solid #4d6670; padding: 2px 4px; } .pdf-checkbox, .pdf-radio { padding: 0; accent-color: #0c7770; background: rgba(255,255,255,.95); } .pdf-select { padding: 0 2px; }"
+    style = ".-epub-media-overlay-active { background: #fff2a8 !important; } .page { position: relative; overflow: hidden; page-break-after: always; } .page-text { position: absolute; inset: 0; z-index: 2; } .pdf-page-background { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 1; } .pdf-text { position: absolute; white-space: pre; overflow: visible; color: transparent !important; } .pdf-span { display: inline; vertical-align: baseline; color: transparent !important; } .pdf-span.-epub-media-overlay-active { color: transparent !important; background: #fff2a8 !important; } .pdf-image { display: none; } .pdf-widget { position: absolute; z-index: 4; box-sizing: border-box; font: inherit; color: #111; background: rgba(255,255,255,.88); border: 1px solid #4d6670; padding: 2px 4px; } .pdf-checkbox, .pdf-radio { padding: 0; accent-color: #0c7770; background: rgba(255,255,255,.95); } .pdf-select { padding: 0 2px; } .pdf-media { position: absolute; z-index: 5; background: rgba(255,255,255,.95); border: 1px solid #4d6670; }"
     output = BytesIO()
     with ZipFile(output, "w") as archive:
         archive.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
@@ -229,7 +282,31 @@ def build_epub(title: str, pages: list[dict[str, object]]) -> bytes:
             archive.writestr(audio_name, audio_bytes, compress_type=ZIP_DEFLATED)
         for image_name, image_bytes, _ in image_files:
             archive.writestr(image_name, image_bytes, compress_type=ZIP_DEFLATED)
+        for media_name, media_bytes, _ in media_files:
+            archive.writestr(media_name, media_bytes, compress_type=ZIP_DEFLATED)
     return output.getvalue()
+
+
+def render_media(media: list[dict[str, object]], index: int, width: float, height: float, rotation: int) -> tuple[str, list[tuple[str, bytes, str]]]:
+    markup: list[str] = []
+    files: list[tuple[str, bytes, str]] = []
+    for media_index, item in enumerate(media, start=1):
+        original_name = Path(str(item["name"])).name
+        safe_name = "".join(char if char.isalnum() or char in ".-_" else "_" for char in original_name)
+        asset_name = f"OEBPS/media/page-{index}-{media_index}-{safe_name}"
+        files.append((asset_name, item["data"], item["mime"]))
+        bbox = item.get("bbox")
+        if bbox:
+            left, top, right, bottom = transform_bbox(bbox, width, height, rotation)
+            style = f"left:{left:.2f}px;top:{top:.2f}px;width:{max(right-left, 160):.2f}px;height:{max(bottom-top, 80):.2f}px;"
+        else:
+            style = "left:20px;bottom:20px;width:280px;height:auto;"
+        relative_name = asset_name.removeprefix("OEBPS/")
+        if item["kind"] == "audio":
+            markup.append(f'<audio class="pdf-media" controls preload="metadata" style="{style}" aria-label="Audio from PDF"><source src="{relative_name}" type="{item["mime"]}"/></audio>')
+        else:
+            markup.append(f'<video class="pdf-media" controls preload="metadata" style="{style}" aria-label="Video from PDF"><source src="{relative_name}" type="{item["mime"]}"/></video>')
+    return "".join(markup), files
 
 
 def render_page(page: dict[str, object], index: int, width: float, height: float, rotation: int) -> tuple[str, list[tuple[str, bytes]]]:
