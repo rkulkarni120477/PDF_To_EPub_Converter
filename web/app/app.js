@@ -15,17 +15,17 @@ const currentSource = document.querySelector('#currentSource');
 const currentSourceFoot = document.querySelector('#currentSourceFoot');
 const outputProfile = document.querySelector('#outputProfile');
 const outputProfileFoot = document.querySelector('#outputProfileFoot');
+const outputFormat = document.querySelector('#outputFormat');
 const layoutSelect = document.querySelector('#layoutSelect');
 const useAzureDI = document.querySelector('#useAzureDI');
 const runAccessibilityChecks = document.querySelector('#runAccessibilityChecks');
 const activityList = document.querySelector('#activityList');
-const liveFailure = document.querySelector('#liveFailure');
-const liveFailureDetails = document.querySelector('#liveFailureDetails');
 const libraryList = document.querySelector('#libraryList');
 const libraryCount = document.querySelector('#libraryCount');
 const settingsSaved = document.querySelector('#settingsSaved');
 const clearStorageButton = document.querySelector('#clearStorageButton');
 const clearLibraryButton = document.querySelector('#clearLibraryButton');
+const clearActivityButton = document.querySelector('#clearActivityButton');
 const apiBaseUrl = 'http://127.0.0.1:8000';
 let selectedFile = null;
 const activityStorageKey = 'academian-conversion-activity';
@@ -35,6 +35,26 @@ function showToast(message) {
   toast.textContent = message;
   toast.classList.add('show');
   window.setTimeout(() => toast.classList.remove('show'), 2800);
+}
+
+function setFile(file) {
+  if (!file || (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf'))) {
+    showToast('Please choose a PDF document.');
+    return;
+  }
+  selectedFile = file;
+  conversionFailureReason.hidden = true;
+  conversionFailureReason.textContent = '';
+  downloadLink.hidden = true;
+  dropTitle.textContent = file.name;
+  dropText.textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB ready to process`;
+  sourceFile.querySelector('strong').textContent = file.name;
+  sourceFile.querySelector('span:not(.pdf-badge)').textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB · Added just now`;
+  currentSource.textContent = file.name;
+  currentSourceFoot.textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB · Ready for conversion`;
+  conversionStatus.innerHTML = '<i></i>Ready to convert';
+  conversionStatusFoot.textContent = 'Source document selected';
+  showToast('Source document added.');
 }
 
 function formatTime(timestamp) {
@@ -73,13 +93,10 @@ function recordConversion(result) {
   localStorage.setItem(activityStorageKey, JSON.stringify(activities.slice(0, 10)));
   renderActivity();
   renderLibrary();
-  liveFailure.hidden = true;
 }
 
 function recordConversionFailure(error) {
   const filename = selectedFile?.name || 'PDF conversion';
-  liveFailureDetails.textContent = `${filename}: ${error}`;
-  liveFailure.hidden = false;
   const activities = JSON.parse(localStorage.getItem(activityStorageKey) || '[]');
   activities.unshift({
     title: filename,
@@ -94,99 +111,9 @@ function recordConversionFailure(error) {
   document.querySelector('#activity').scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
-document.querySelectorAll('.nav-item, .brand').forEach((link) => link.addEventListener('click', () => {
-  document.querySelectorAll('.primary-nav .nav-item').forEach((item) => item.classList.toggle('active', item.getAttribute('href') === link.getAttribute('href')));
-}));
-renderActivity();
-renderLibrary();
-
-const savedToggles = JSON.parse(localStorage.getItem(toggleStorageKey) || '{}');
-if (savedToggles.useAzureDI !== undefined) useAzureDI.checked = savedToggles.useAzureDI;
-if (savedToggles.runAccessibilityChecks !== undefined) runAccessibilityChecks.checked = savedToggles.runAccessibilityChecks;
-[useAzureDI, runAccessibilityChecks].forEach((toggle) => toggle.addEventListener('change', () => {
-  localStorage.setItem(toggleStorageKey, JSON.stringify({
-    useAzureDI: useAzureDI.checked,
-    runAccessibilityChecks: runAccessibilityChecks.checked,
-  }));
-}));
-
-clearStorageButton.addEventListener('click', () => {
-  if (!window.confirm('Clear saved conversions and workspace settings from this browser?')) return;
-  localStorage.removeItem(activityStorageKey);
-  localStorage.removeItem('academian-settings');
-    localStorage.removeItem(toggleStorageKey);
-    useAzureDI.checked = false;
-    runAccessibilityChecks.checked = true;
-  renderActivity();
-  renderLibrary();
-  settingsSaved.textContent = 'Cleared';
-  showToast('Local storage cleared.');
-  window.setTimeout(() => { settingsSaved.textContent = 'Saved locally'; }, 1800);
-});
-
-clearLibraryButton.addEventListener('click', async () => {
-  const activities = JSON.parse(localStorage.getItem(activityStorageKey) || '[]');
-  if (!activities.length) {
-    showToast('Library is already empty.');
-    return;
-  }
-  if (!window.confirm('Delete all generated ePub files from the Library?')) return;
-  clearLibraryButton.disabled = true;
-  try {
-    const response = await fetch(`${apiBaseUrl}/api/v1/conversions`, { method: 'DELETE' });
-    const result = await response.json();
-    if (!response.ok || result.status !== 'cleared') throw new Error('Could not clear the Library.');
-    localStorage.removeItem(activityStorageKey);
-    renderActivity();
-    renderLibrary();
-    showToast(`Deleted ${result.deleted} generated file${result.deleted === 1 ? '' : 's'}.`);
-  } catch (error) {
-    showToast(error.message);
-  } finally {
-    clearLibraryButton.disabled = false;
-  }
-});
-
-const settingsInputs = ['defaultOutput', 'defaultLayout', 'defaultDirection', 'defaultAccessibility'].map((id) => document.querySelector(`#${id}`));
-const savedSettings = JSON.parse(localStorage.getItem('academian-settings') || '{}');
-settingsInputs.forEach((input) => {
-  if (!input) return;
-  if (savedSettings[input.id] !== undefined) {
-    if (input.type === 'checkbox') input.checked = savedSettings[input.id];
-    else input.value = savedSettings[input.id];
-  }
-  input.addEventListener('change', () => {
-    const settings = JSON.parse(localStorage.getItem('academian-settings') || '{}');
-    settings[input.id] = input.type === 'checkbox' ? input.checked : input.value;
-    localStorage.setItem('academian-settings', JSON.stringify(settings));
-    settingsSaved.textContent = 'Saved just now';
-    window.setTimeout(() => { settingsSaved.textContent = 'Saved locally'; }, 1800);
-  });
-});
-
-document.querySelector('#inviteButton').addEventListener('click', () => showToast('Invite link copied for your review team.'));
-
-function setFile(file) {
-  if (!file || (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf'))) {
-    showToast('Please choose a PDF document.');
-    return;
-  }
-  selectedFile = file;
-  liveFailure.hidden = true;
-  conversionFailureReason.hidden = true;
-  conversionFailureReason.textContent = '';
-  downloadLink.hidden = true;
-  dropTitle.textContent = file.name;
-  dropText.textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB ready to process`;
-  sourceFile.querySelector('strong').textContent = file.name;
-  sourceFile.querySelector('span:not(.pdf-badge)').textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB · Added just now`;
-  currentSource.textContent = file.name;
-  currentSourceFoot.textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB · Ready for conversion`;
-  conversionStatus.innerHTML = '<i></i>Ready to convert';
-  conversionStatusFoot.textContent = 'Source document selected';
-  showToast('Source document added.');
-}
-
+// Core file-selection and conversion wiring is attached first, and before any code that
+// could throw (e.g. a stale page missing an element some other section expects) so the
+// "Choose PDF" button and conversion flow keep working even if a later section fails.
 browseButton.addEventListener('click', () => fileInput.click());
 fileInput.addEventListener('change', (event) => setFile(event.target.files[0]));
 ['dragenter', 'dragover'].forEach((eventName) => dropzone.addEventListener(eventName, (event) => {
@@ -243,7 +170,7 @@ convertButton.addEventListener('click', () => {
     })
     : Promise.resolve();
   const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), 190000);
+  const timeoutId = window.setTimeout(() => controller.abort(), 900000);
   configurationCheck.then(() => fetch(`${apiBaseUrl}/api/v1/conversions`, { method: 'POST', body: formData, signal: controller.signal }))
     .then(async (response) => {
       const result = await response.json();
@@ -279,3 +206,109 @@ convertButton.addEventListener('click', () => {
       convertButton.innerHTML = 'Start conversion <span>-></span>';
     });
 });
+
+// Everything below is secondary workspace chrome (nav highlighting, activity/library
+// rendering, saved toggles, settings panel). It's wrapped so that a missing element here
+// (e.g. from a stale cached page) can't take down the conversion flow wired above.
+try {
+  function updateOutputProfilePreview() {
+    const layoutLabel = layoutSelect.value === 'fixed' ? 'fixed layout' : 'reflowable';
+    outputProfile.textContent = `${outputFormat.value} ${layoutLabel}`;
+    const extras = [];
+    if (useAzureDI.checked) extras.push('Azure DI');
+    extras.push('Read Aloud');
+    if (runAccessibilityChecks.checked) extras.push('Accessibility checks');
+    outputProfileFoot.textContent = extras.join(' + ');
+  }
+
+  document.querySelectorAll('.nav-item, .brand').forEach((link) => link.addEventListener('click', () => {
+    document.querySelectorAll('.primary-nav .nav-item').forEach((item) => item.classList.toggle('active', item.getAttribute('href') === link.getAttribute('href')));
+  }));
+  renderActivity();
+  renderLibrary();
+
+  const savedToggles = JSON.parse(localStorage.getItem(toggleStorageKey) || '{}');
+  if (savedToggles.useAzureDI !== undefined) useAzureDI.checked = savedToggles.useAzureDI;
+  if (savedToggles.runAccessibilityChecks !== undefined) runAccessibilityChecks.checked = savedToggles.runAccessibilityChecks;
+  [useAzureDI, runAccessibilityChecks].forEach((toggle) => toggle.addEventListener('change', () => {
+    localStorage.setItem(toggleStorageKey, JSON.stringify({
+      useAzureDI: useAzureDI.checked,
+      runAccessibilityChecks: runAccessibilityChecks.checked,
+    }));
+    updateOutputProfilePreview();
+  }));
+  [outputFormat, layoutSelect].forEach((control) => control.addEventListener('change', updateOutputProfilePreview));
+  updateOutputProfilePreview();
+
+  clearStorageButton.addEventListener('click', () => {
+    if (!window.confirm('Clear saved conversions and workspace settings from this browser?')) return;
+    localStorage.removeItem(activityStorageKey);
+    localStorage.removeItem('academian-settings');
+    localStorage.removeItem(toggleStorageKey);
+    useAzureDI.checked = false;
+    runAccessibilityChecks.checked = true;
+    renderActivity();
+    renderLibrary();
+    updateOutputProfilePreview();
+    settingsSaved.textContent = 'Cleared';
+    showToast('Local storage cleared.');
+    window.setTimeout(() => { settingsSaved.textContent = 'Saved locally'; }, 1800);
+  });
+
+  clearLibraryButton.addEventListener('click', async () => {
+    const activities = JSON.parse(localStorage.getItem(activityStorageKey) || '[]');
+    if (!activities.length) {
+      showToast('Library is already empty.');
+      return;
+    }
+    if (!window.confirm('Delete all generated ePub files from the Library?')) return;
+    clearLibraryButton.disabled = true;
+    try {
+      const response = await fetch(`${apiBaseUrl}/api/v1/conversions`, { method: 'DELETE' });
+      const result = await response.json();
+      if (!response.ok || result.status !== 'cleared') throw new Error('Could not clear the Library.');
+      localStorage.removeItem(activityStorageKey);
+      renderActivity();
+      renderLibrary();
+      showToast(`Deleted ${result.deleted} generated file${result.deleted === 1 ? '' : 's'}.`);
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      clearLibraryButton.disabled = false;
+    }
+  });
+
+  clearActivityButton.addEventListener('click', () => {
+    const activities = JSON.parse(localStorage.getItem(activityStorageKey) || '[]');
+    if (!activities.length) {
+      showToast('Recent activity is already empty.');
+      return;
+    }
+    if (!window.confirm('Clear recent activity from this workspace?')) return;
+    localStorage.removeItem(activityStorageKey);
+    renderActivity();
+    renderLibrary();
+    showToast('Recent activity cleared.');
+  });
+
+  const settingsInputs = ['defaultOutput', 'defaultLayout', 'defaultDirection', 'defaultAccessibility'].map((id) => document.querySelector(`#${id}`));
+  const savedSettings = JSON.parse(localStorage.getItem('academian-settings') || '{}');
+  settingsInputs.forEach((input) => {
+    if (!input) return;
+    if (savedSettings[input.id] !== undefined) {
+      if (input.type === 'checkbox') input.checked = savedSettings[input.id];
+      else input.value = savedSettings[input.id];
+    }
+    input.addEventListener('change', () => {
+      const settings = JSON.parse(localStorage.getItem('academian-settings') || '{}');
+      settings[input.id] = input.type === 'checkbox' ? input.checked : input.value;
+      localStorage.setItem('academian-settings', JSON.stringify(settings));
+      settingsSaved.textContent = 'Saved just now';
+      window.setTimeout(() => { settingsSaved.textContent = 'Saved locally'; }, 1800);
+    });
+  });
+
+  document.querySelector('#inviteButton').addEventListener('click', () => showToast('Invite link copied for your review team.'));
+} catch (error) {
+  console.error('Academian workspace chrome failed to initialize:', error);
+}
