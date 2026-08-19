@@ -18,7 +18,14 @@ const outputProfileFoot = document.querySelector('#outputProfileFoot');
 const outputFormat = document.querySelector('#outputFormat');
 const layoutSelect = document.querySelector('#layoutSelect');
 const useAzureDI = document.querySelector('#useAzureDI');
+const generateNarration = document.querySelector('#generateNarration');
 const runAccessibilityChecks = document.querySelector('#runAccessibilityChecks');
+const progressDot = document.querySelector('#progressDot');
+const progressStage = document.querySelector('#progressStage');
+const progressTrack = document.querySelector('#progressTrack');
+const progressBar = document.querySelector('#progressBar');
+const progressPercent = document.querySelector('#progressPercent');
+const progressDetail = document.querySelector('#progressDetail');
 const activityList = document.querySelector('#activityList');
 const libraryList = document.querySelector('#libraryList');
 const libraryCount = document.querySelector('#libraryCount');
@@ -35,6 +42,92 @@ function showToast(message) {
   toast.textContent = message;
   toast.classList.add('show');
   window.setTimeout(() => toast.classList.remove('show'), 2800);
+}
+
+function setProgressPanel({ state, stage, detail, percent }) {
+  const value = Math.max(0, Math.min(100, Math.round(percent)));
+  progressDot.classList.remove('active', 'done', 'error');
+  progressTrack.classList.remove('done', 'error');
+  progressPercent.classList.remove('done', 'error');
+  if (state) progressDot.classList.add(state);
+  if (state === 'done' || state === 'error') {
+    progressTrack.classList.add(state);
+    progressPercent.classList.add(state);
+  }
+  progressStage.textContent = stage;
+  progressDetail.textContent = detail;
+  progressPercent.textContent = `${value}%`;
+  progressBar.style.width = `${value}%`;
+  progressTrack.setAttribute('aria-valuenow', String(value));
+  progressTrack.setAttribute('aria-valuetext', `${stage} - ${value}%`);
+}
+
+function resetProgressPanel() {
+  setProgressPanel({ state: null, stage: 'Idle', detail: 'No conversion running', percent: 0 });
+}
+
+// A failed run keeps the percentage it reached, so the bar reports how far the pipeline
+// actually got rather than implying the work finished.
+function currentProgressPercent() {
+  return Number(progressTrack.getAttribute('aria-valuenow')) || 0;
+}
+
+// The gateway reports a stage plus a page counter inside that stage. Each stage owns a
+// slice of the overall bar so the bar advances monotonically instead of restarting from
+// zero every time the pipeline moves to the next stage.
+const stageWeights = [
+  { match: 'Starting', start: 0, span: 3 },
+  { match: 'Reading', start: 3, span: 5 },
+  { match: 'Extracting', start: 8, span: 22 },
+  { match: 'Rasterizing', start: 30, span: 15 },
+  { match: 'Analyzing', start: 45, span: 15 },
+  { match: 'Cleaning', start: 60, span: 10 },
+  { match: 'Azure DI timed out', start: 70, span: 0 },
+  { match: 'Rendering', start: 70, span: 25 },
+  { match: 'Packaging', start: 95, span: 5 },
+];
+
+function stagePercent(status) {
+  const stage = String(status.stage || '');
+  const weight = stageWeights.find((entry) => stage.startsWith(entry.match)) || { start: 50, span: 40 };
+  const total = Number(status.total_pages) || 0;
+  const current = Number(status.current_page) || 0;
+  const ratio = total > 0 ? Math.min(1, current / total) : 0;
+  return weight.start + weight.span * ratio;
+}
+
+function pollConversion(conversionId, signal) {
+  return new Promise((resolve, reject) => {
+    const tick = async () => {
+      try {
+        const response = await fetch(`${apiBaseUrl}/api/v1/conversions/${conversionId}/status`, { signal });
+        if (!response.ok) throw new Error('Lost track of the conversion job.');
+        const status = await response.json();
+        if (status.status === 'completed') {
+          setProgressPanel({ state: 'done', stage: 'Completed', detail: `${status.pages} page${status.pages === 1 ? '' : 's'} converted`, percent: 100 });
+          resolve(status);
+          return;
+        }
+        if (status.status === 'failed') {
+          setProgressPanel({ state: 'error', stage: 'Failed', detail: status.detail || 'Conversion failed', percent: currentProgressPercent() });
+          reject(new Error(status.detail || 'Conversion failed.'));
+          return;
+        }
+        const total = Number(status.total_pages) || 0;
+        setProgressPanel({
+          state: 'active',
+          stage: status.stage || 'Processing',
+          // A stage with no page counter (the Azure DI call) reports its own liveness text.
+          detail: status.detail || (total > 0 ? `Page ${Math.min(Number(status.current_page) || 0, total)} of ${total}` : 'Preparing document'),
+          percent: stagePercent(status),
+        });
+        window.setTimeout(tick, 900);
+      } catch (error) {
+        reject(error);
+      }
+    };
+    tick();
+  });
 }
 
 function setFile(file) {
@@ -143,6 +236,7 @@ document.querySelector('.remove-button').addEventListener('click', () => {
   conversionStatusFoot.textContent = 'No conversion run yet';
   conversionFailureReason.hidden = true;
   conversionFailureReason.textContent = '';
+  resetProgressPanel();
   showToast('Source document removed.');
 });
 
@@ -157,11 +251,13 @@ convertButton.addEventListener('click', () => {
   convertButton.disabled = true;
   convertButton.textContent = 'Converting PDF...';
   conversionStatus.innerHTML = '<i></i>Conversion in progress';
-  conversionStatusFoot.textContent = 'Preserving pages, forms, images, and Read Aloud audio';
+  conversionStatusFoot.textContent = 'Preserving pages, forms, and images';
+  setProgressPanel({ state: 'active', stage: 'Uploading PDF', detail: selectedFile.name, percent: 2 });
   const formData = new FormData();
   formData.append('file', selectedFile);
   formData.append('layout', layoutSelect.value);
   formData.append('use_azure_di', useAzureDI.checked ? 'true' : 'false');
+  formData.append('narrate', generateNarration.checked ? 'true' : 'false');
   const configurationCheck = useAzureDI.checked
     ? fetch(`${apiBaseUrl}/api/v1/capabilities`).then((response) => response.json()).then((capabilities) => {
       if (!capabilities.azure_document_intelligence_configured) {
@@ -173,8 +269,13 @@ convertButton.addEventListener('click', () => {
   const timeoutId = window.setTimeout(() => controller.abort(), 900000);
   configurationCheck.then(() => fetch(`${apiBaseUrl}/api/v1/conversions`, { method: 'POST', body: formData, signal: controller.signal }))
     .then(async (response) => {
-      const result = await response.json();
-          if (!response.ok || result.status !== 'completed') throw new Error(result.detail || result.reason || 'Conversion failed.');
+      // The gateway only queues the job here and returns immediately; the EPUB is produced
+      // by a background task whose progress is read from the status endpoint below.
+      const accepted = await response.json();
+      if (!response.ok || !accepted.conversion_id) throw new Error(accepted.detail || 'Conversion could not be started.');
+      return pollConversion(accepted.conversion_id, controller.signal);
+    })
+    .then((result) => {
       downloadLink.href = `${apiBaseUrl}${result.download_url}`;
       downloadLink.download = `${result.title}.epub`;
       downloadLink.hidden = false;
@@ -187,7 +288,7 @@ convertButton.addEventListener('click', () => {
       currentSource.textContent = selectedFile.name;
       currentSourceFoot.textContent = `${(selectedFile.size / 1024 / 1024).toFixed(1)} MB · Converted successfully`;
       outputProfile.textContent = result.layout === 'fixed' ? 'ePub 3.2 fixed' : 'ePub 3.2 reflowable';
-      outputProfileFoot.textContent = `${result.azure_document_intelligence ? 'Azure DI + ' : ''}Read Aloud + extracted HTML content`;
+      outputProfileFoot.textContent = `${result.azure_document_intelligence ? 'Azure DI + ' : ''}Extracted HTML content`;
       recordConversion(result);
       showToast(`Created ePub from ${result.pages} page(s).`);
     })
@@ -197,6 +298,7 @@ convertButton.addEventListener('click', () => {
       conversionStatusFoot.textContent = message;
       conversionFailureReason.textContent = `Reason: ${message}`;
       conversionFailureReason.hidden = false;
+      setProgressPanel({ state: 'error', stage: 'Failed', detail: message, percent: currentProgressPercent() });
       recordConversionFailure(message);
       showToast(message);
     })
@@ -216,7 +318,7 @@ try {
     outputProfile.textContent = `${outputFormat.value} ${layoutLabel}`;
     const extras = [];
     if (useAzureDI.checked) extras.push('Azure DI');
-    extras.push('Read Aloud');
+    if (generateNarration.checked) extras.push('Read Aloud');
     if (runAccessibilityChecks.checked) extras.push('Accessibility checks');
     outputProfileFoot.textContent = extras.join(' + ');
   }
@@ -226,13 +328,16 @@ try {
   }));
   renderActivity();
   renderLibrary();
+  resetProgressPanel();
 
   const savedToggles = JSON.parse(localStorage.getItem(toggleStorageKey) || '{}');
   if (savedToggles.useAzureDI !== undefined) useAzureDI.checked = savedToggles.useAzureDI;
+  if (savedToggles.generateNarration !== undefined) generateNarration.checked = savedToggles.generateNarration;
   if (savedToggles.runAccessibilityChecks !== undefined) runAccessibilityChecks.checked = savedToggles.runAccessibilityChecks;
-  [useAzureDI, runAccessibilityChecks].forEach((toggle) => toggle.addEventListener('change', () => {
+  [useAzureDI, generateNarration, runAccessibilityChecks].forEach((toggle) => toggle.addEventListener('change', () => {
     localStorage.setItem(toggleStorageKey, JSON.stringify({
       useAzureDI: useAzureDI.checked,
+      generateNarration: generateNarration.checked,
       runAccessibilityChecks: runAccessibilityChecks.checked,
     }));
     updateOutputProfilePreview();
@@ -246,6 +351,7 @@ try {
     localStorage.removeItem('academian-settings');
     localStorage.removeItem(toggleStorageKey);
     useAzureDI.checked = false;
+    generateNarration.checked = false;
     runAccessibilityChecks.checked = true;
     renderActivity();
     renderLibrary();

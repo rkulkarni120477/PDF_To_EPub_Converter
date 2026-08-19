@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Callable
 from uuid import uuid4
 import wave
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
@@ -38,6 +39,52 @@ app.add_middleware(
 )
 
 CONVERSIONS: dict[str, tuple[str, bytes]] = {}
+CONVERSION_PROGRESS: dict[str, dict[str, object]] = {}
+# asyncio only holds a weak reference to a task once created, so a task with no other
+# referent can be garbage-collected mid-run; this set keeps every in-flight conversion
+# task alive until it finishes, regardless of whether the request that started it is done.
+BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def set_progress(conversion_id: str, **fields: object) -> None:
+    CONVERSION_PROGRESS[conversion_id] = {**CONVERSION_PROGRESS.get(conversion_id, {}), **fields}
+
+
+def track_background_task(task: asyncio.Task) -> None:
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+
+
+# Budget for the whole Azure DI round trip. It used to be 600s, which meant an unreachable
+# or wedged endpoint froze the UI for ten minutes before falling back to local extraction.
+AZURE_DI_TIMEOUT_SECONDS = 150
+AZURE_DI_POLLING_INTERVAL_SECONDS = 2
+
+
+async def await_with_heartbeat(conversion_id: str, stage: str, awaitable, timeout: float, total_pages: int):
+    """Await a long single-shot step while still publishing progress.
+
+    Stages that are one opaque blocking call (the Azure DI analyse in particular) otherwise
+    leave the status frozen on their initial value, which is indistinguishable from a hang.
+    """
+    task = asyncio.ensure_future(awaitable)
+    started = time.monotonic()
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=1)
+        if done:
+            return task.result()
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout:
+            task.cancel()
+            raise asyncio.TimeoutError
+        set_progress(
+            conversion_id,
+            status="processing",
+            stage=stage,
+            current_page=0,
+            total_pages=total_pages,
+            detail=f"Waiting on Azure Document Intelligence - {int(elapsed)}s elapsed (times out at {int(timeout)}s)",
+        )
 
 
 def custom_openapi() -> dict[str, object]:
@@ -96,46 +143,128 @@ def capabilities() -> dict[str, object]:
 
 
 @app.post("/api/v1/conversions")
-async def convert_pdf(file: UploadFile | None = File(None), layout: str = Form("auto"), use_azure_di: bool = Form(False)) -> dict[str, str | int | bool]:
+async def convert_pdf(file: UploadFile | None = File(None), layout: str = Form("auto"), use_azure_di: bool = Form(False), narrate: bool = Form(False)) -> dict[str, str]:
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="A PDF file is required.")
     if Path(file.filename).suffix.lower() != ".pdf":
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     source = await file.read()
-    try:
-        pages = await asyncio.wait_for(asyncio.to_thread(extract_pdf_pages, source), timeout=120)
-    except (fitz.FileDataError, ValueError) as error:
-        raise HTTPException(status_code=400, detail="The uploaded file is not a readable PDF.") from error
-    except asyncio.TimeoutError as error:
-        raise HTTPException(status_code=504, detail="PDF layout extraction timed out.") from error
-    if use_azure_di:
-        try:
-            azure_pages = await asyncio.wait_for(asyncio.to_thread(extract_with_azure_di, source), timeout=180)
-            pages = await asyncio.wait_for(asyncio.to_thread(merge_azure_text, pages, azure_pages), timeout=180)
-        except AzureExtractionError as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
-        except asyncio.TimeoutError as error:
-            logger.warning("Azure Document Intelligence extraction timed out; continuing with local PDF extraction.")
-            use_azure_di = False
     conversion_id = uuid4().hex
-    title = Path(file.filename).stem.replace("_", " ").replace("-", " ").strip() or "Converted document"
+    set_progress(conversion_id, status="processing", stage="Starting conversion", current_page=0, total_pages=0)
+    # The actual work runs as a background task instead of being awaited here, so this
+    # request returns immediately - the frontend polls /status for live progress instead of
+    # holding one HTTP connection open for the whole conversion (which is what made large or
+    # Azure DI conversions look "stuck" and eventually time out with no EPUB produced).
+    track_background_task(asyncio.create_task(run_conversion(conversion_id, source, file.filename, layout, use_azure_di, narrate)))
+    return {"status": "processing", "conversion_id": conversion_id}
+
+
+@app.get("/api/v1/conversions/{conversion_id}/status")
+def conversion_status(conversion_id: str) -> dict[str, object]:
+    progress = CONVERSION_PROGRESS.get(conversion_id)
+    if progress is None:
+        raise HTTPException(status_code=404, detail="Conversion not found.")
+    return {**progress, "conversion_id": conversion_id}
+
+
+async def run_conversion(conversion_id: str, source: bytes, filename: str, layout: str, use_azure_di: bool, narrate: bool = False) -> None:
+    title = Path(filename).stem.replace("_", " ").replace("-", " ").strip() or "Converted document"
     try:
-        epub = await asyncio.wait_for(asyncio.to_thread(build_epub, title, pages, layout), timeout=600)
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    except asyncio.TimeoutError as error:
-        raise HTTPException(status_code=504, detail="EPUB generation timed out. Try a smaller PDF or fewer pages.") from error
-    CONVERSIONS[conversion_id] = (f"{title}.epub", epub)
-    return {
-        "status": "completed",
-        "conversion_id": conversion_id,
-        "title": title,
-        "pages": len(pages),
-        "layout": resolve_layout(layout, pages),
-        "azure_document_intelligence": use_azure_di,
-        "download_url": f"/api/v1/downloads/{conversion_id}",
-    }
+        set_progress(conversion_id, status="processing", stage="Reading PDF", current_page=0, total_pages=0)
+
+        def extraction_progress(current_page: int, total_pages: int) -> None:
+            set_progress(conversion_id, status="processing", stage="Extracting pages", current_page=current_page, total_pages=total_pages)
+
+        try:
+            pages = await asyncio.wait_for(asyncio.to_thread(extract_pdf_pages, source, extraction_progress), timeout=300)
+        except (fitz.FileDataError, ValueError):
+            set_progress(conversion_id, status="failed", stage="Failed", detail="The uploaded file is not a readable PDF.")
+            return
+        except asyncio.TimeoutError:
+            set_progress(conversion_id, status="failed", stage="Failed", detail="PDF layout extraction timed out.")
+            return
+
+        # Layout is resolved once, here, so the decision is made on the locally extracted
+        # text and stays stable for the rest of the run (Azure DI merging rewrites page text
+        # and could otherwise flip an "auto" document to a different layout mid-conversion).
+        resolved_layout = resolve_layout(layout, pages)
+
+        # Rasterising every page at 2x into PNG is the single most expensive step, and the
+        # result is only ever used as a fixed-layout background or as the canvas Azure DI
+        # text is erased from. Reflowable conversions skip it entirely.
+        if resolved_layout == "fixed" or use_azure_di:
+            def rasterize_progress(current_page: int, total_pages: int) -> None:
+                set_progress(conversion_id, status="processing", stage="Rasterizing pages", current_page=current_page, total_pages=total_pages)
+
+            set_progress(conversion_id, status="processing", stage="Rasterizing pages", current_page=0, total_pages=len(pages))
+            try:
+                await asyncio.wait_for(asyncio.to_thread(render_page_images, source, pages, rasterize_progress), timeout=600)
+            except asyncio.TimeoutError:
+                set_progress(conversion_id, status="failed", stage="Failed", detail="Rendering page images timed out.")
+                return
+
+        if use_azure_di:
+            set_progress(conversion_id, status="processing", stage="Analyzing with Azure Document Intelligence", current_page=0, total_pages=len(pages), detail="Uploading document to Azure Document Intelligence")
+            try:
+                azure_pages = await await_with_heartbeat(
+                    conversion_id,
+                    "Analyzing with Azure Document Intelligence",
+                    asyncio.to_thread(extract_with_azure_di, source),
+                    AZURE_DI_TIMEOUT_SECONDS,
+                    len(pages),
+                )
+            except AzureExtractionError as error:
+                set_progress(conversion_id, status="failed", stage="Failed", detail=str(error))
+                return
+            except asyncio.TimeoutError:
+                # Azure DI only enriches text and cleans the page backgrounds, so a slow or
+                # unreachable endpoint degrades to the local extraction instead of failing.
+                logger.warning("Azure Document Intelligence extraction timed out after %ss; continuing with local PDF extraction.", AZURE_DI_TIMEOUT_SECONDS)
+                set_progress(conversion_id, status="processing", stage="Azure DI timed out - using local extraction", current_page=0, total_pages=len(pages), detail=None)
+                use_azure_di = False
+
+        if use_azure_di:
+            def merge_progress(current_page: int, total_pages: int) -> None:
+                set_progress(conversion_id, status="processing", stage="Cleaning page images", current_page=current_page, total_pages=total_pages, detail=None)
+
+            set_progress(conversion_id, status="processing", stage="Cleaning page images", current_page=0, total_pages=len(pages), detail=None)
+            try:
+                pages = await asyncio.wait_for(asyncio.to_thread(merge_azure_text, pages, azure_pages, merge_progress), timeout=300)
+            except asyncio.TimeoutError:
+                logger.warning("Azure Document Intelligence merge timed out; continuing with local PDF extraction.")
+                use_azure_di = False
+
+        def build_progress(current_page: int, total_pages: int) -> None:
+            set_progress(conversion_id, status="processing", stage="Rendering pages", current_page=current_page, total_pages=total_pages)
+
+        set_progress(conversion_id, status="processing", stage="Rendering pages", current_page=0, total_pages=len(pages))
+        try:
+            epub = await asyncio.wait_for(asyncio.to_thread(build_epub, title, pages, resolved_layout, build_progress, narrate), timeout=1800)
+        except RuntimeError as error:
+            set_progress(conversion_id, status="failed", stage="Failed", detail=str(error))
+            return
+        except asyncio.TimeoutError:
+            set_progress(conversion_id, status="failed", stage="Failed", detail="EPUB generation timed out. Try a smaller PDF or fewer pages.")
+            return
+
+        set_progress(conversion_id, status="processing", stage="Packaging EPUB", current_page=len(pages), total_pages=len(pages))
+        CONVERSIONS[conversion_id] = (f"{title}.epub", epub)
+        set_progress(
+            conversion_id,
+            status="completed",
+            stage="Completed",
+            current_page=len(pages),
+            total_pages=len(pages),
+            title=title,
+            pages=len(pages),
+            layout=resolved_layout,
+            azure_document_intelligence=use_azure_di,
+            download_url=f"/api/v1/downloads/{conversion_id}",
+        )
+    except Exception:
+        logger.exception("Conversion %s failed unexpectedly", conversion_id)
+        set_progress(conversion_id, status="failed", stage="Failed", detail="An unexpected error occurred during conversion.")
 
 
 class AzureExtractionError(RuntimeError):
@@ -152,11 +281,19 @@ def extract_with_azure_di(source: bytes) -> list[dict[str, object]]:
     if not endpoint or not key:
         raise AzureExtractionError("Azure Document Intelligence is enabled, but AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT and AZURE_DOCUMENT_INTELLIGENCE_KEY are not configured for the gateway process.")
     try:
-        client = DocumentIntelligenceClient(endpoint=endpoint.rstrip("/"), credential=AzureKeyCredential(key))
+        client = DocumentIntelligenceClient(
+            endpoint=endpoint.rstrip("/"),
+            credential=AzureKeyCredential(key),
+            # Without explicit socket timeouts a wedged endpoint leaves the request blocked
+            # indefinitely, which reads as a hung conversion rather than a failed one.
+            connection_timeout=30,
+            read_timeout=60,
+        )
         poller = client.begin_analyze_document(
             "prebuilt-layout",
             body=BytesIO(source),
             content_type="application/pdf",
+            polling_interval=AZURE_DI_POLLING_INTERVAL_SECONDS,
         )
         result = poller.result()
     except HttpResponseError as error:
@@ -197,8 +334,10 @@ def extract_with_azure_di(source: bytes) -> list[dict[str, object]]:
     return pages
 
 
-def merge_azure_text(pages: list[dict[str, object]], azure_pages: list[dict[str, object]]) -> list[dict[str, object]]:
+def merge_azure_text(pages: list[dict[str, object]], azure_pages: list[dict[str, object]], on_progress: Callable[[int, int], None] | None = None) -> list[dict[str, object]]:
     for index, azure_page in enumerate(azure_pages):
+        if on_progress:
+            on_progress(index + 1, len(azure_pages))
         if index >= len(pages) or not azure_page["text"]:
             continue
         pages[index]["text"] = azure_page["text"]
@@ -346,15 +485,19 @@ def inline_epub_assets(markup: str, archive: ZipFile, names: set[str]) -> str:
 def clear_conversions() -> dict[str, int | str]:
     deleted_count = len(CONVERSIONS)
     CONVERSIONS.clear()
+    CONVERSION_PROGRESS.clear()
     return {"status": "cleared", "deleted": deleted_count}
 
 
-def extract_pdf_pages(source: bytes) -> list[dict[str, object]]:
+def extract_pdf_pages(source: bytes, on_progress: Callable[[int, int], None] | None = None) -> list[dict[str, object]]:
     document = fitz.open(stream=source, filetype="pdf")
     pages: list[dict[str, object]] = []
     document_media = extract_document_media(document)
+    total_pages = len(document)
     try:
-        for page in document:
+        for page_number, page in enumerate(document, start=1):
+            if on_progress:
+                on_progress(page_number, total_pages)
             page_dict = page.get_text("dict")
             complete_text = page.get_text("text", sort=True).strip()
             blocks: list[dict[str, object]] = []
@@ -418,12 +561,28 @@ def extract_pdf_pages(source: bytes) -> list[dict[str, object]]:
                 "rotation": page.rotation,
                 "blocks": blocks,
                 "text": complete_text or " ".join(page_text).strip(),
-                "page_image": page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).tobytes("png"),
+                # Filled in later by render_page_images(), and only when a fixed layout or an
+                # Azure DI pass actually needs the rasterised page.
+                "page_image": b"",
                 "media": media,
             })
     finally:
         document.close()
     return pages
+
+
+def render_page_images(source: bytes, pages: list[dict[str, object]], on_progress: Callable[[int, int], None] | None = None) -> None:
+    document = fitz.open(stream=source, filetype="pdf")
+    total_pages = len(pages)
+    try:
+        for index, page in enumerate(document, start=1):
+            if index > total_pages:
+                break
+            if on_progress:
+                on_progress(index, total_pages)
+            pages[index - 1]["page_image"] = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).tobytes("png")
+    finally:
+        document.close()
 
 
 def extract_document_media(document: fitz.Document) -> list[dict[str, object]]:
@@ -473,7 +632,7 @@ def resolve_layout(layout: str, pages: list[dict[str, object]]) -> str:
     return "reflowable" if text_pages >= max(1, len(pages) // 2) else "fixed"
 
 
-def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto") -> bytes:
+def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto", on_progress: Callable[[int, int], None] | None = None, narrate: bool = False) -> bytes:
     resolved_layout = resolve_layout(layout, pages)
     fixed_layout = resolved_layout == "fixed"
     narration_deadline = time.monotonic() + 120
@@ -483,6 +642,8 @@ def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto")
     image_files: list[tuple[str, bytes, str]] = []
     media_files: list[tuple[str, bytes, str]] = []
     for index, page in enumerate(pages, start=1):
+        if on_progress:
+            on_progress(index, len(pages))
         raw_text = str(page["text"]).strip()
         page_text = raw_text or "This page did not contain extractable text."
         width = float(page["width"])
@@ -508,7 +669,9 @@ def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto")
         image_files.extend((name, data, Path(name).suffix.lstrip(".")) for name, data in page_images)
         media_files.extend(page_media_files)
         narration = None
-        if raw_text and time.monotonic() < narration_deadline:
+        # Each narrated page costs a fresh Python + SAPI subprocess, which dominated the
+        # runtime of every conversion, so Read Aloud audio is only produced on request.
+        if narrate and raw_text and time.monotonic() < narration_deadline:
             try:
                 narration = synthesize_speech(page_text, max_seconds=narration_deadline - time.monotonic())
             except RuntimeError as error:
