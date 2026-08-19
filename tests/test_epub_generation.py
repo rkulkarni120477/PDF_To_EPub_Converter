@@ -1,12 +1,24 @@
 import io
+import re
 import sys
 import unittest
 import zipfile
 import xml.etree.ElementTree as ElementTree
-from unittest.mock import patch
+import pymupdf
+import cv2
+import numpy as np
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, "services/api-gateway")
-from app.main import AzureExtractionError, build_epub, merge_azure_text
+from app.main import (
+    AzureExtractionError,
+    build_epub,
+    extract_pdf_pages,
+    extract_with_azure_di,
+    merge_azure_text,
+    remove_ocr_text_from_background,
+    remove_ocr_text_from_embedded_images,
+)
 
 
 class EpubGenerationTests(unittest.TestCase):
@@ -152,8 +164,185 @@ class EpubGenerationTests(unittest.TestCase):
         self.assertEqual(merged[0]["text"], "Azure extracted text")
         self.assertEqual(merged[0]["azure_lines"][0]["text"], "Azure extracted text")
 
+    def test_background_text_is_still_erased_when_azure_omits_page_dimensions(self):
+        # DocumentPage.width/height are optional in the Azure SDK and can come back None for
+        # a page even when it has text - dict.get(key, default) does not fall back in that
+        # case (the key is present, just holding None), which used to leave azure_width/height
+        # as None and made remove_ocr_text_from_background bail out, keeping the original
+        # (uncleaned) background image with all of its text still baked in.
+        document = pymupdf.open()
+        page = document.new_page(width=400, height=300)
+        page.insert_text((20, 40), "A line of text that must be erased from the background")
+        source = document.tobytes()
+        document.close()
+
+        pages = extract_pdf_pages(source)
+        line_bbox = pages[0]["blocks"][0]["lines"][0]["bbox"]
+        left, top, right, bottom = line_bbox
+        azure_pages = [{
+            "text": "A line of text that must be erased from the background",
+            "lines": [{"text": "line", "polygon": [left, top, right, top, right, bottom, left, bottom]}],
+            "words": [],
+            "width": None,
+            "height": None,
+        }]
+
+        merged = merge_azure_text(pages, azure_pages)
+
+        # The background PNG is rendered at 2x zoom (see extract_pdf_pages), so the bbox
+        # (in PDF points) must be scaled up to index the actual pixel array.
+        cleaned = cv2.imdecode(np.frombuffer(merged[0]["page_image"], dtype=np.uint8), cv2.IMREAD_COLOR)
+        zoom = cleaned.shape[1] / pages[0]["width"]
+        crop = cleaned[int(top * zoom):int(bottom * zoom), int(left * zoom):int(right * zoom)]
+        self.assertGreater(int(np.mean(crop)), 200)
+
     def test_azure_configuration_error_is_explicit(self):
         self.assertTrue(issubclass(AzureExtractionError, RuntimeError))
+
+    @patch.dict("app.main.os.environ", {
+        "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT": "https://example.cognitiveservices.azure.com/",
+        "AZURE_DOCUMENT_INTELLIGENCE_KEY": "test-key",
+    })
+    @patch("app.main.DocumentIntelligenceClient")
+    def test_azure_pdf_is_sent_as_application_pdf(self, client_class):
+        client = client_class.return_value
+        result_page = MagicMock()
+        result_page.lines = [MagicMock(content="Azure line")]
+        client.begin_analyze_document.return_value.result.return_value.pages = [result_page]
+
+        pages = extract_with_azure_di(b"%PDF-test")
+
+        call = client.begin_analyze_document.call_args
+        self.assertEqual(call.args[0], "prebuilt-layout")
+        self.assertEqual(call.kwargs["content_type"], "application/pdf")
+        self.assertEqual(call.kwargs["body"].read(), b"%PDF-test")
+        self.assertEqual(pages[0]["text"], "Azure line")
+
+    @patch("app.main.synthesize_speech", return_value=(b"audio", 1.0))
+    def test_complete_pdf_text_is_written_to_oebps_html(self, _speech):
+        document = pymupdf.open()
+        page = document.new_page()
+        page.insert_text((40, 60), "First complete line")
+        page.insert_text((40, 90), "Second complete line")
+        source = document.tobytes()
+        document.close()
+
+        pages = extract_pdf_pages(source)
+        with zipfile.ZipFile(io.BytesIO(build_epub("Complete text", pages, "reflowable"))) as archive:
+            html = archive.read("OEBPS/page-1.xhtml").decode("utf-8")
+
+        self.assertIn("First complete line", html)
+        self.assertIn("Second complete line", html)
+
+    @patch("app.main.synthesize_speech", return_value=(b"audio", 1.0))
+    def test_background_image_ocr_text_is_written_to_fixed_html(self, _speech):
+        page = self._page("OCR text from background image")
+        page["azure_lines"] = [{"text": "OCR text from background image", "spans": []}]
+        page["background_image_text"] = "OCR text from background image"
+
+        with zipfile.ZipFile(io.BytesIO(build_epub("Image OCR", [page], "fixed"))) as archive:
+            html = archive.read("OEBPS/page-1.xhtml").decode("utf-8")
+
+        self.assertIn("OCR text from background image", html)
+        self.assertIn("class=\"page-text accessibility-text\"", html)
+
+    @patch("app.main.synthesize_speech", return_value=(b"audio", 1.0))
+    def test_azure_ocr_lines_are_placed_within_rotated_container(self, _speech):
+        # page["width"]/["height"] are the PDF's unrotated cropbox dimensions (portrait,
+        # 200x300); the page is rotated 90 degrees, so the fixed-layout container becomes
+        # landscape (300x200) to match the background image. Azure reports its polygons in
+        # that same visual/landscape space, as it does for a real rotated scan.
+        page = {
+            "width": 200,
+            "height": 300,
+            "rotation": 90,
+            "text": "HELLO\nWORLD",
+            "page_image": b"page image",
+            "media": [],
+            "blocks": [],
+            "azure_lines": [
+                {"text": "HELLO", "polygon": [10, 10, 110, 10, 110, 40, 10, 40]},
+                {"text": "WORLD", "polygon": [10, 50, 110, 50, 110, 80, 10, 80]},
+            ],
+            "azure_width": 300,
+            "azure_height": 200,
+        }
+
+        with zipfile.ZipFile(io.BytesIO(build_epub("Rotated OCR", [page], "fixed"))) as archive:
+            html = archive.read("OEBPS/page-1.xhtml").decode("utf-8")
+
+        # The container must match the rotated (landscape) visual size, not the raw portrait
+        # cropbox - otherwise the background image renders stretched into the wrong shape.
+        self.assertIn('style="width:300.00px;height:200.00px;"', html)
+
+        boxes = []
+        for match in re.finditer(r'<div class="ocr-line"[^>]*style="([^"]*)"', html):
+            style = dict(item.split(":") for item in match.group(1).rstrip(";").split(";"))
+            boxes.append({key: float(value.rstrip("px")) for key, value in style.items() if key != "line-height"})
+        self.assertEqual(len(boxes), 2)
+        for box in boxes:
+            # Both lines must land inside the rotated 300x200 container...
+            self.assertLessEqual(box["left"] + box["width"], 300)
+            self.assertLessEqual(box["top"] + box["height"], 200)
+        # ...and not on top of each other.
+        first, second = sorted(boxes, key=lambda box: box["top"])
+        self.assertLessEqual(first["top"] + first["height"], second["top"])
+
+    def test_ocr_polygon_removes_background_text_pixels(self):
+        image = np.full((100, 200, 3), 255, dtype=np.uint8)
+        cv2.putText(image, "TEXT", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 3)
+        success, encoded = cv2.imencode(".png", image)
+        self.assertTrue(success)
+        cleaned = remove_ocr_text_from_background(
+            encoded.tobytes(), [{"polygon": [25, 35, 90, 35, 90, 70, 25, 70]}], 100, 50
+        )
+        cleaned_image = cv2.imdecode(np.frombuffer(cleaned, dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertGreater(int(np.mean(cleaned_image[35:70, 50:90])), 180)
+
+    def test_embedded_page_image_ocr_text_is_erased(self):
+        image = np.full((100, 200, 3), 255, dtype=np.uint8)
+        cv2.putText(image, "SCAN", (30, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 3)
+        success, encoded = cv2.imencode(".png", image)
+        self.assertTrue(success)
+
+        blocks = [{"type": "image", "bbox": (0, 0, 200, 100), "data": encoded.tobytes(), "ext": "png"}]
+        # Word polygon in Azure's page-coordinate space (azure page is 100x50, half the
+        # block's own pixel size), landing on the same text drawn above.
+        ocr_regions = [{"polygon": [12.5, 17.5, 45, 17.5, 45, 35, 12.5, 35]}]
+
+        remove_ocr_text_from_embedded_images(blocks, ocr_regions, 200, 100, 100, 50)
+
+        self.assertEqual(blocks[0]["ext"], "png")
+        cleaned_image = cv2.imdecode(np.frombuffer(blocks[0]["data"], dtype=np.uint8), cv2.IMREAD_COLOR)
+        self.assertGreater(int(np.mean(cleaned_image[35:70, 50:90])), 180)
+
+    def test_embedded_page_image_without_overlapping_text_is_untouched(self):
+        original_bytes = b"not-a-real-image"
+        blocks = [{"type": "image", "bbox": (0, 0, 200, 100), "data": original_bytes, "ext": "jpg"}]
+        # Polygon sits entirely outside the block's bbox once mapped to page coordinates.
+        ocr_regions = [{"polygon": [500, 500, 520, 500, 520, 520, 500, 520]}]
+
+        remove_ocr_text_from_embedded_images(blocks, ocr_regions, 200, 100, 100, 50)
+
+        self.assertEqual(blocks[0]["data"], original_bytes)
+        self.assertEqual(blocks[0]["ext"], "jpg")
+
+    @patch("app.main.synthesize_speech", return_value=(b"audio", 1.0))
+    def test_fixed_html_keeps_extracted_image_reference(self, _speech):
+        page = self._page("Page with image")
+        page["blocks"].append({
+            "type": "image",
+            "bbox": (80, 120, 240, 240),
+            "data": b"png-bytes",
+            "ext": "png",
+        })
+
+        with zipfile.ZipFile(io.BytesIO(build_epub("Image page", [page], "fixed"))) as archive:
+            names = archive.namelist()
+            html = archive.read("OEBPS/page-1.xhtml").decode("utf-8")
+
+        self.assertIn("OEBPS/images/page-1-1.png", names)
+        self.assertIn('src="images/page-1-1.png"', html)
 
     @staticmethod
     def _page(text: str) -> dict[str, object]:
