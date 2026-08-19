@@ -139,6 +139,7 @@ function setFile(file) {
   conversionFailureReason.hidden = true;
   conversionFailureReason.textContent = '';
   downloadLink.hidden = true;
+  resetProgressPanel();
   dropTitle.textContent = file.name;
   dropText.textContent = `${(file.size / 1024 / 1024).toFixed(1)} MB ready to process`;
   sourceFile.querySelector('strong').textContent = file.name;
