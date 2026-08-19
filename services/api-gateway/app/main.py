@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from typing import Callable
 from uuid import uuid4
 import wave
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
@@ -18,8 +19,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, StreamingResponse
 import pymupdf as fitz
-import cv2
-import numpy as np
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import HttpResponseError, ServiceRequestError, ServiceResponseError
@@ -38,6 +37,52 @@ app.add_middleware(
 )
 
 CONVERSIONS: dict[str, tuple[str, bytes]] = {}
+CONVERSION_PROGRESS: dict[str, dict[str, object]] = {}
+# asyncio only holds a weak reference to a task once created, so a task with no other
+# referent can be garbage-collected mid-run; this set keeps every in-flight conversion
+# task alive until it finishes, regardless of whether the request that started it is done.
+BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def set_progress(conversion_id: str, **fields: object) -> None:
+    CONVERSION_PROGRESS[conversion_id] = {**CONVERSION_PROGRESS.get(conversion_id, {}), **fields}
+
+
+def track_background_task(task: asyncio.Task) -> None:
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+
+
+# Budget for the whole Azure DI round trip. It used to be 600s, which meant an unreachable
+# or wedged endpoint froze the UI for ten minutes before falling back to local extraction.
+AZURE_DI_TIMEOUT_SECONDS = 150
+AZURE_DI_POLLING_INTERVAL_SECONDS = 2
+
+
+async def await_with_heartbeat(conversion_id: str, stage: str, awaitable, timeout: float, total_pages: int):
+    """Await a long single-shot step while still publishing progress.
+
+    Stages that are one opaque blocking call (the Azure DI analyse in particular) otherwise
+    leave the status frozen on their initial value, which is indistinguishable from a hang.
+    """
+    task = asyncio.ensure_future(awaitable)
+    started = time.monotonic()
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=1)
+        if done:
+            return task.result()
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout:
+            task.cancel()
+            raise asyncio.TimeoutError
+        set_progress(
+            conversion_id,
+            status="processing",
+            stage=stage,
+            current_page=0,
+            total_pages=total_pages,
+            detail=f"Waiting on Azure Document Intelligence - {int(elapsed)}s elapsed (times out at {int(timeout)}s)",
+        )
 
 
 def custom_openapi() -> dict[str, object]:
@@ -96,46 +141,128 @@ def capabilities() -> dict[str, object]:
 
 
 @app.post("/api/v1/conversions")
-async def convert_pdf(file: UploadFile | None = File(None), layout: str = Form("auto"), use_azure_di: bool = Form(False)) -> dict[str, str | int | bool]:
+async def convert_pdf(file: UploadFile | None = File(None), layout: str = Form("auto"), use_azure_di: bool = Form(False), narrate: bool = Form(False)) -> dict[str, str]:
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="A PDF file is required.")
     if Path(file.filename).suffix.lower() != ".pdf":
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     source = await file.read()
-    try:
-        pages = await asyncio.wait_for(asyncio.to_thread(extract_pdf_pages, source), timeout=120)
-    except (fitz.FileDataError, ValueError) as error:
-        raise HTTPException(status_code=400, detail="The uploaded file is not a readable PDF.") from error
-    except asyncio.TimeoutError as error:
-        raise HTTPException(status_code=504, detail="PDF layout extraction timed out.") from error
-    if use_azure_di:
-        try:
-            azure_pages = await asyncio.wait_for(asyncio.to_thread(extract_with_azure_di, source), timeout=180)
-            pages = await asyncio.wait_for(asyncio.to_thread(merge_azure_text, pages, azure_pages), timeout=180)
-        except AzureExtractionError as error:
-            raise HTTPException(status_code=503, detail=str(error)) from error
-        except asyncio.TimeoutError as error:
-            logger.warning("Azure Document Intelligence extraction timed out; continuing with local PDF extraction.")
-            use_azure_di = False
     conversion_id = uuid4().hex
-    title = Path(file.filename).stem.replace("_", " ").replace("-", " ").strip() or "Converted document"
+    set_progress(conversion_id, status="processing", stage="Starting conversion", current_page=0, total_pages=0)
+    # The actual work runs as a background task instead of being awaited here, so this
+    # request returns immediately - the frontend polls /status for live progress instead of
+    # holding one HTTP connection open for the whole conversion (which is what made large or
+    # Azure DI conversions look "stuck" and eventually time out with no EPUB produced).
+    track_background_task(asyncio.create_task(run_conversion(conversion_id, source, file.filename, layout, use_azure_di, narrate)))
+    return {"status": "processing", "conversion_id": conversion_id}
+
+
+@app.get("/api/v1/conversions/{conversion_id}/status")
+def conversion_status(conversion_id: str) -> dict[str, object]:
+    progress = CONVERSION_PROGRESS.get(conversion_id)
+    if progress is None:
+        raise HTTPException(status_code=404, detail="Conversion not found.")
+    return {**progress, "conversion_id": conversion_id}
+
+
+async def run_conversion(conversion_id: str, source: bytes, filename: str, layout: str, use_azure_di: bool, narrate: bool = False) -> None:
+    title = Path(filename).stem.replace("_", " ").replace("-", " ").strip() or "Converted document"
     try:
-        epub = await asyncio.wait_for(asyncio.to_thread(build_epub, title, pages, layout), timeout=600)
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    except asyncio.TimeoutError as error:
-        raise HTTPException(status_code=504, detail="EPUB generation timed out. Try a smaller PDF or fewer pages.") from error
-    CONVERSIONS[conversion_id] = (f"{title}.epub", epub)
-    return {
-        "status": "completed",
-        "conversion_id": conversion_id,
-        "title": title,
-        "pages": len(pages),
-        "layout": resolve_layout(layout, pages),
-        "azure_document_intelligence": use_azure_di,
-        "download_url": f"/api/v1/downloads/{conversion_id}",
-    }
+        set_progress(conversion_id, status="processing", stage="Reading PDF", current_page=0, total_pages=0)
+
+        def extraction_progress(current_page: int, total_pages: int) -> None:
+            set_progress(conversion_id, status="processing", stage="Extracting pages", current_page=current_page, total_pages=total_pages)
+
+        try:
+            pages = await asyncio.wait_for(asyncio.to_thread(extract_pdf_pages, source, extraction_progress), timeout=300)
+        except (fitz.FileDataError, ValueError):
+            set_progress(conversion_id, status="failed", stage="Failed", detail="The uploaded file is not a readable PDF.")
+            return
+        except asyncio.TimeoutError:
+            set_progress(conversion_id, status="failed", stage="Failed", detail="PDF layout extraction timed out.")
+            return
+
+        # Layout is resolved once, here, so the decision is made on the locally extracted
+        # text and stays stable for the rest of the run (Azure DI merging rewrites page text
+        # and could otherwise flip an "auto" document to a different layout mid-conversion).
+        resolved_layout = resolve_layout(layout, pages)
+
+        # Rasterising every page at 2x into PNG is the single most expensive step, and the
+        # result is only ever used as a fixed-layout background or as the canvas Azure DI
+        # text is erased from. Reflowable conversions skip it entirely.
+        if resolved_layout == "fixed" or use_azure_di:
+            def rasterize_progress(current_page: int, total_pages: int) -> None:
+                set_progress(conversion_id, status="processing", stage="Rasterizing pages", current_page=current_page, total_pages=total_pages)
+
+            set_progress(conversion_id, status="processing", stage="Rasterizing pages", current_page=0, total_pages=len(pages))
+            try:
+                await asyncio.wait_for(asyncio.to_thread(render_page_images, source, pages, rasterize_progress), timeout=600)
+            except asyncio.TimeoutError:
+                set_progress(conversion_id, status="failed", stage="Failed", detail="Rendering page images timed out.")
+                return
+
+        if use_azure_di:
+            set_progress(conversion_id, status="processing", stage="Analyzing with Azure Document Intelligence", current_page=0, total_pages=len(pages), detail="Uploading document to Azure Document Intelligence")
+            try:
+                azure_pages = await await_with_heartbeat(
+                    conversion_id,
+                    "Analyzing with Azure Document Intelligence",
+                    asyncio.to_thread(extract_with_azure_di, source),
+                    AZURE_DI_TIMEOUT_SECONDS,
+                    len(pages),
+                )
+            except AzureExtractionError as error:
+                set_progress(conversion_id, status="failed", stage="Failed", detail=str(error))
+                return
+            except asyncio.TimeoutError:
+                # Azure DI only enriches text and cleans the page backgrounds, so a slow or
+                # unreachable endpoint degrades to the local extraction instead of failing.
+                logger.warning("Azure Document Intelligence extraction timed out after %ss; continuing with local PDF extraction.", AZURE_DI_TIMEOUT_SECONDS)
+                set_progress(conversion_id, status="processing", stage="Azure DI timed out - using local extraction", current_page=0, total_pages=len(pages), detail=None)
+                use_azure_di = False
+
+        if use_azure_di:
+            def merge_progress(current_page: int, total_pages: int) -> None:
+                set_progress(conversion_id, status="processing", stage="Cleaning page images", current_page=current_page, total_pages=total_pages, detail=None)
+
+            set_progress(conversion_id, status="processing", stage="Cleaning page images", current_page=0, total_pages=len(pages), detail=None)
+            try:
+                pages = await asyncio.wait_for(asyncio.to_thread(merge_azure_text, pages, azure_pages, merge_progress), timeout=300)
+            except asyncio.TimeoutError:
+                logger.warning("Azure Document Intelligence merge timed out; continuing with local PDF extraction.")
+                use_azure_di = False
+
+        def build_progress(current_page: int, total_pages: int) -> None:
+            set_progress(conversion_id, status="processing", stage="Rendering pages", current_page=current_page, total_pages=total_pages)
+
+        set_progress(conversion_id, status="processing", stage="Rendering pages", current_page=0, total_pages=len(pages))
+        try:
+            epub = await asyncio.wait_for(asyncio.to_thread(build_epub, title, pages, resolved_layout, build_progress, narrate), timeout=1800)
+        except RuntimeError as error:
+            set_progress(conversion_id, status="failed", stage="Failed", detail=str(error))
+            return
+        except asyncio.TimeoutError:
+            set_progress(conversion_id, status="failed", stage="Failed", detail="EPUB generation timed out. Try a smaller PDF or fewer pages.")
+            return
+
+        set_progress(conversion_id, status="processing", stage="Packaging EPUB", current_page=len(pages), total_pages=len(pages))
+        CONVERSIONS[conversion_id] = (f"{title}.epub", epub)
+        set_progress(
+            conversion_id,
+            status="completed",
+            stage="Completed",
+            current_page=len(pages),
+            total_pages=len(pages),
+            title=title,
+            pages=len(pages),
+            layout=resolved_layout,
+            azure_document_intelligence=use_azure_di,
+            download_url=f"/api/v1/downloads/{conversion_id}",
+        )
+    except Exception:
+        logger.exception("Conversion %s failed unexpectedly", conversion_id)
+        set_progress(conversion_id, status="failed", stage="Failed", detail="An unexpected error occurred during conversion.")
 
 
 class AzureExtractionError(RuntimeError):
@@ -152,11 +279,19 @@ def extract_with_azure_di(source: bytes) -> list[dict[str, object]]:
     if not endpoint or not key:
         raise AzureExtractionError("Azure Document Intelligence is enabled, but AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT and AZURE_DOCUMENT_INTELLIGENCE_KEY are not configured for the gateway process.")
     try:
-        client = DocumentIntelligenceClient(endpoint=endpoint.rstrip("/"), credential=AzureKeyCredential(key))
+        client = DocumentIntelligenceClient(
+            endpoint=endpoint.rstrip("/"),
+            credential=AzureKeyCredential(key),
+            # Without explicit socket timeouts a wedged endpoint leaves the request blocked
+            # indefinitely, which reads as a hung conversion rather than a failed one.
+            connection_timeout=30,
+            read_timeout=60,
+        )
         poller = client.begin_analyze_document(
             "prebuilt-layout",
             body=BytesIO(source),
             content_type="application/pdf",
+            polling_interval=AZURE_DI_POLLING_INTERVAL_SECONDS,
         )
         result = poller.result()
     except HttpResponseError as error:
@@ -197,100 +332,20 @@ def extract_with_azure_di(source: bytes) -> list[dict[str, object]]:
     return pages
 
 
-def merge_azure_text(pages: list[dict[str, object]], azure_pages: list[dict[str, object]]) -> list[dict[str, object]]:
+def merge_azure_text(pages: list[dict[str, object]], azure_pages: list[dict[str, object]], on_progress: Callable[[int, int], None] | None = None) -> list[dict[str, object]]:
     for index, azure_page in enumerate(azure_pages):
+        if on_progress:
+            on_progress(index + 1, len(azure_pages))
         if index >= len(pages) or not azure_page["text"]:
             continue
         pages[index]["text"] = azure_page["text"]
         pages[index]["azure_lines"] = azure_page["lines"]
         pages[index]["background_image_text"] = azure_page["text"]
-        # dict.get(key, default) only falls back when the key is absent - Azure Document
-        # Intelligence's width/height are optional and can come back None for a page, in
-        # which case .get() would still return that None and silently defeat every erasure
-        # below (remove_ocr_text_from_background bails out on a falsy ocr_width/ocr_height).
-        # `or` falls back on None (and on 0) too, so text actually gets erased either way.
-        azure_width = azure_page.get("width") or pages[index]["width"]
-        azure_height = azure_page.get("height") or pages[index]["height"]
-        pages[index]["azure_width"] = azure_width
-        pages[index]["azure_height"] = azure_height
-        ocr_regions = azure_page.get("words", []) or azure_page["lines"]
-        pages[index]["page_image"] = remove_ocr_text_from_background(
-            pages[index]["page_image"], ocr_regions, azure_width, azure_height
-        )
-        remove_ocr_text_from_embedded_images(
-            pages[index]["blocks"], ocr_regions, pages[index]["width"], pages[index]["height"], azure_width, azure_height
-        )
+        # Azure Document Intelligence's width/height are optional and can come back None,
+        # so `or` (not .get's default) is what actually falls back to the PDF's own size.
+        pages[index]["azure_width"] = azure_page.get("width") or pages[index]["width"]
+        pages[index]["azure_height"] = azure_page.get("height") or pages[index]["height"]
     return pages
-
-
-def remove_ocr_text_from_background(
-    image_bytes: bytes,
-    lines: list[dict[str, object]],
-    ocr_width: float,
-    ocr_height: float,
-) -> bytes:
-    image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if image is None or not ocr_width or not ocr_height:
-        return image_bytes
-    mask = np.zeros(image.shape[:2], dtype=np.uint8)
-    image_height, image_width = image.shape[:2]
-    for line in lines:
-        polygon = line.get("polygon", [])
-        points = [
-            (
-                round(float(polygon[i]) / ocr_width * image_width),
-                round(float(polygon[i + 1]) / ocr_height * image_height),
-            )
-            for i in range(0, len(polygon) - 1, 2)
-        ]
-        if len(points) >= 3:
-            cv2.fillPoly(mask, [np.array(points, dtype=np.int32)], 255)
-    if not np.any(mask):
-        return image_bytes
-    scale = min(image_width / ocr_width, image_height / ocr_height)
-    padding = max(2, round(scale * 1.5))
-    kernel_size = padding * 2 + 1
-    mask = cv2.dilate(mask, np.ones((kernel_size, kernel_size), dtype=np.uint8), iterations=1)
-    cleaned = cv2.inpaint(image, mask, max(3, padding), cv2.INPAINT_TELEA)
-    success, encoded = cv2.imencode(".png", cleaned)
-    return encoded.tobytes() if success else image_bytes
-
-
-def remove_ocr_text_from_embedded_images(
-    blocks: list[dict[str, object]],
-    ocr_regions: list[dict[str, object]],
-    page_width: float,
-    page_height: float,
-    azure_width: float,
-    azure_height: float,
-) -> None:
-    if not ocr_regions or not azure_width or not azure_height:
-        return
-    for block in blocks:
-        if block.get("type") != "image":
-            continue
-        left, top, right, bottom = block["bbox"]
-        block_width = right - left
-        block_height = bottom - top
-        if block_width <= 0 or block_height <= 0:
-            continue
-        local_regions: list[dict[str, object]] = []
-        for region in ocr_regions:
-            polygon = region.get("polygon", [])
-            if len(polygon) < 6:
-                continue
-            xs = [float(polygon[i]) / azure_width * page_width for i in range(0, len(polygon) - 1, 2)]
-            ys = [float(polygon[i + 1]) / azure_height * page_height for i in range(0, len(polygon) - 1, 2)]
-            center_x, center_y = sum(xs) / len(xs), sum(ys) / len(ys)
-            if not (left <= center_x <= right and top <= center_y <= bottom):
-                continue
-            local_regions.append({"polygon": [value for x, y in zip(xs, ys) for value in (x - left, y - top)]})
-        if not local_regions:
-            continue
-        cleaned = remove_ocr_text_from_background(block["data"], local_regions, block_width, block_height)
-        if cleaned != block["data"]:
-            block["data"] = cleaned
-            block["ext"] = "png"
 
 
 @app.get("/api/v1/downloads/{conversion_id}")
@@ -346,15 +401,19 @@ def inline_epub_assets(markup: str, archive: ZipFile, names: set[str]) -> str:
 def clear_conversions() -> dict[str, int | str]:
     deleted_count = len(CONVERSIONS)
     CONVERSIONS.clear()
+    CONVERSION_PROGRESS.clear()
     return {"status": "cleared", "deleted": deleted_count}
 
 
-def extract_pdf_pages(source: bytes) -> list[dict[str, object]]:
+def extract_pdf_pages(source: bytes, on_progress: Callable[[int, int], None] | None = None) -> list[dict[str, object]]:
     document = fitz.open(stream=source, filetype="pdf")
     pages: list[dict[str, object]] = []
     document_media = extract_document_media(document)
+    total_pages = len(document)
     try:
-        for page in document:
+        for page_number, page in enumerate(document, start=1):
+            if on_progress:
+                on_progress(page_number, total_pages)
             page_dict = page.get_text("dict")
             complete_text = page.get_text("text", sort=True).strip()
             blocks: list[dict[str, object]] = []
@@ -418,12 +477,28 @@ def extract_pdf_pages(source: bytes) -> list[dict[str, object]]:
                 "rotation": page.rotation,
                 "blocks": blocks,
                 "text": complete_text or " ".join(page_text).strip(),
-                "page_image": page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).tobytes("png"),
+                # Filled in later by render_page_images(), and only when a fixed layout or an
+                # Azure DI pass actually needs the rasterised page.
+                "page_image": b"",
                 "media": media,
             })
     finally:
         document.close()
     return pages
+
+
+def render_page_images(source: bytes, pages: list[dict[str, object]], on_progress: Callable[[int, int], None] | None = None) -> None:
+    document = fitz.open(stream=source, filetype="pdf")
+    total_pages = len(pages)
+    try:
+        for index, page in enumerate(document, start=1):
+            if index > total_pages:
+                break
+            if on_progress:
+                on_progress(index, total_pages)
+            pages[index - 1]["page_image"] = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False).tobytes("png")
+    finally:
+        document.close()
 
 
 def extract_document_media(document: fitz.Document) -> list[dict[str, object]]:
@@ -473,7 +548,7 @@ def resolve_layout(layout: str, pages: list[dict[str, object]]) -> str:
     return "reflowable" if text_pages >= max(1, len(pages) // 2) else "fixed"
 
 
-def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto") -> bytes:
+def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto", on_progress: Callable[[int, int], None] | None = None, narrate: bool = False) -> bytes:
     resolved_layout = resolve_layout(layout, pages)
     fixed_layout = resolved_layout == "fixed"
     narration_deadline = time.monotonic() + 120
@@ -483,6 +558,8 @@ def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto")
     image_files: list[tuple[str, bytes, str]] = []
     media_files: list[tuple[str, bytes, str]] = []
     for index, page in enumerate(pages, start=1):
+        if on_progress:
+            on_progress(index, len(pages))
         raw_text = str(page["text"]).strip()
         page_text = raw_text or "This page did not contain extractable text."
         width = float(page["width"])
@@ -508,7 +585,9 @@ def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto")
         image_files.extend((name, data, Path(name).suffix.lstrip(".")) for name, data in page_images)
         media_files.extend(page_media_files)
         narration = None
-        if raw_text and time.monotonic() < narration_deadline:
+        # Each narrated page costs a fresh Python + SAPI subprocess, which dominated the
+        # runtime of every conversion, so Read Aloud audio is only produced on request.
+        if narrate and raw_text and time.monotonic() < narration_deadline:
             try:
                 narration = synthesize_speech(page_text, max_seconds=narration_deadline - time.monotonic())
             except RuntimeError as error:
@@ -548,7 +627,7 @@ def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto")
 </package>'''
     nav_items = "".join(f'<li><a href="{name}">Page {index}</a></li>' for index, (name, _) in enumerate(page_documents, start=1))
     nav = f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{safe_title}</title></head><body><nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><h1>Contents</h1><ol>{nav_items}</ol></nav></body></html>'''
-    style = ".-epub-media-overlay-active { background: #fff2a8 !important; } .page { margin: 0 auto; } .page.fixed { position: relative; overflow: hidden; page-break-after: always; } .page.reflowable { max-width: 48rem; padding: 2rem 1.5rem; } .fixed .page-text { position: absolute; inset: 0; z-index: 2; } .fixed .accessibility-text { width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: normal; border: 0; } .fixed .accessibility-text p { margin: 0; } .fixed .ocr-text-layer { width: auto; height: auto; margin: 0; overflow: visible; clip: auto; white-space: normal; color: #17232b; } .fixed .ocr-line { position: absolute; white-space: nowrap; overflow: hidden; } .pdf-page-background { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 1; } .pdf-span { display: inline; vertical-align: baseline; } .reflow-image { display: block; max-width: 100%; height: auto; margin: 1rem auto; } .reflow-paragraph { margin: 0 0 .75rem; line-height: 1.45; } .reflow-field { display: block; margin: .75rem 0; color: #17232b; } .reflow-field input, .reflow-field select { margin-left: .5rem; padding: .35rem; } .pdf-widget { position: absolute; z-index: 4; box-sizing: border-box; font: inherit; color: #111; background: rgba(255,255,255,.88); border: 1px solid #4d6670; padding: 2px 4px; } .pdf-checkbox, .pdf-radio { padding: 0; accent-color: #0c7770; background: rgba(255,255,255,.95); } .pdf-select { padding: 0 2px; } .pdf-media { z-index: 5; background: rgba(255,255,255,.95); }"
+    style = ".-epub-media-overlay-active { background: #fff2a8 !important; } .page { margin: 0 auto; } .page.fixed { position: relative; overflow: hidden; page-break-after: always; } .page.reflowable { max-width: 48rem; padding: 2rem 1.5rem; } .fixed .page-text { position: absolute; inset: 0; z-index: 2; } .fixed .accessibility-text { width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: normal; border: 0; } .fixed .accessibility-text p { margin: 0; } .fixed .ocr-text-layer { width: auto; height: auto; margin: 0; overflow: visible; clip: auto; white-space: normal; } .fixed .ocr-line { position: absolute; white-space: nowrap; overflow: hidden; color: transparent; } .fixed .ocr-line::selection { background: #b7dcff88; } .pdf-page-background { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 1; } .pdf-span { display: inline; vertical-align: baseline; } .reflow-image { display: block; max-width: 100%; height: auto; margin: 1rem auto; } .reflow-paragraph { margin: 0 0 .75rem; line-height: 1.45; } .reflow-field { display: block; margin: .75rem 0; color: #17232b; } .reflow-field input, .reflow-field select { margin-left: .5rem; padding: .35rem; } .pdf-widget { position: absolute; z-index: 4; box-sizing: border-box; font: inherit; color: #111; background: rgba(255,255,255,.88); border: 1px solid #4d6670; padding: 2px 4px; } .pdf-checkbox, .pdf-radio { padding: 0; accent-color: #0c7770; background: rgba(255,255,255,.95); } .pdf-select { padding: 0 2px; } .pdf-media { z-index: 5; background: rgba(255,255,255,.95); }"
     output = BytesIO()
     with ZipFile(output, "w") as archive:
         archive.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)

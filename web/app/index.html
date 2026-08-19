@@ -11,7 +11,7 @@
     <aside class="sidebar">
       <a class="brand" href="#workspace" aria-label="Academian home">
         <span class="brand-mark">A</span>
-        <span><strong>Academian</strong><small>LEARNING STUDIO</small></span>
+        <span><strong>Academian</strong><small>TOOLS STUDIO</small></span>
       </a>
       <nav class="primary-nav" aria-label="Primary navigation">
         <a class="nav-item active" href="#workspace"><span class="nav-icon">+</span>Workspace</a>
@@ -19,6 +19,12 @@
         <a class="nav-item" href="#activity"><span class="nav-icon">~</span>Activity</a>
         <a class="nav-item" href="#team"><span class="nav-icon">&</span>Team</a>
       </nav>
+      <section class="conversion-progress-panel" id="conversionProgressPanel" aria-label="Conversion progress">
+        <div class="progress-panel-heading"><span class="progress-panel-dot" id="progressDot"></span><span class="progress-panel-label">Conversion status</span></div>
+        <div class="progress-track" role="progressbar" id="progressTrack" aria-label="Conversion completion" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="progressBar"></span></div>
+        <div class="progress-panel-status"><strong class="progress-panel-stage" id="progressStage">Idle</strong><span class="progress-panel-percent" id="progressPercent">0%</span></div>
+        <span class="progress-panel-detail" id="progressDetail">No conversion running</span>
+      </section>
       <div class="sidebar-bottom">
         <div class="storage-label"><span>Storage</span><span>68%</span></div>
         <div class="storage-track"><span></span></div>
@@ -58,6 +64,7 @@
             <div class="settings-grid"><label>Output format<select id="outputFormat"><option>ePub 3.2</option><option>ePub 3.0</option></select></label><label>Reading direction<select><option>Left to right</option><option>Right to left</option></select></label><label>Image quality<select><option>High (recommended)</option><option>Medium</option><option>Original</option></select></label><label>Layout<select id="layoutSelect"><option value="reflowable">Reflowable</option><option value="fixed">Fixed layout</option></select></label></div>
             <label class="toggle-row"><span><strong>Run accessibility checks</strong><small>Validate headings, reading order, contrast, and alt text.</small></span><input id="runAccessibilityChecks" type="checkbox" checked><span class="toggle" aria-hidden="true"></span></label>
             <label class="toggle-row azure-toggle"><span><strong>Use Azure Document Intelligence</strong><small>Use Azure DI Layout for OCR, tables, and document structure.</small></span><input id="useAzureDI" type="checkbox"><span class="toggle" aria-hidden="true"></span></label>
+            <label class="toggle-row"><span><strong>Generate Read Aloud narration</strong><small>Adds synthesized page audio. Significantly slower conversions.</small></span><input id="generateNarration" type="checkbox"><span class="toggle" aria-hidden="true"></span></label>
           </article>
         </div>
 
@@ -82,6 +89,6 @@
     </main>
   </div>
   <div class="toast" id="toast" role="status"></div>
-  <script src="app.js?v=20260819c"></script>
+  <script src="app.js?v=20260819g"></script>
 </body>
 </html>
