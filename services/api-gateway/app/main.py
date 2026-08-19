@@ -19,8 +19,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, StreamingResponse
 import pymupdf as fitz
-import cv2
-import numpy as np
 from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.core.credentials import AzureKeyCredential
 from azure.core.exceptions import HttpResponseError, ServiceRequestError, ServiceResponseError
@@ -343,93 +341,11 @@ def merge_azure_text(pages: list[dict[str, object]], azure_pages: list[dict[str,
         pages[index]["text"] = azure_page["text"]
         pages[index]["azure_lines"] = azure_page["lines"]
         pages[index]["background_image_text"] = azure_page["text"]
-        # dict.get(key, default) only falls back when the key is absent - Azure Document
-        # Intelligence's width/height are optional and can come back None for a page, in
-        # which case .get() would still return that None and silently defeat every erasure
-        # below (remove_ocr_text_from_background bails out on a falsy ocr_width/ocr_height).
-        # `or` falls back on None (and on 0) too, so text actually gets erased either way.
-        azure_width = azure_page.get("width") or pages[index]["width"]
-        azure_height = azure_page.get("height") or pages[index]["height"]
-        pages[index]["azure_width"] = azure_width
-        pages[index]["azure_height"] = azure_height
-        ocr_regions = azure_page.get("words", []) or azure_page["lines"]
-        pages[index]["page_image"] = remove_ocr_text_from_background(
-            pages[index]["page_image"], ocr_regions, azure_width, azure_height
-        )
-        remove_ocr_text_from_embedded_images(
-            pages[index]["blocks"], ocr_regions, pages[index]["width"], pages[index]["height"], azure_width, azure_height
-        )
+        # Azure Document Intelligence's width/height are optional and can come back None,
+        # so `or` (not .get's default) is what actually falls back to the PDF's own size.
+        pages[index]["azure_width"] = azure_page.get("width") or pages[index]["width"]
+        pages[index]["azure_height"] = azure_page.get("height") or pages[index]["height"]
     return pages
-
-
-def remove_ocr_text_from_background(
-    image_bytes: bytes,
-    lines: list[dict[str, object]],
-    ocr_width: float,
-    ocr_height: float,
-) -> bytes:
-    image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if image is None or not ocr_width or not ocr_height:
-        return image_bytes
-    mask = np.zeros(image.shape[:2], dtype=np.uint8)
-    image_height, image_width = image.shape[:2]
-    for line in lines:
-        polygon = line.get("polygon", [])
-        points = [
-            (
-                round(float(polygon[i]) / ocr_width * image_width),
-                round(float(polygon[i + 1]) / ocr_height * image_height),
-            )
-            for i in range(0, len(polygon) - 1, 2)
-        ]
-        if len(points) >= 3:
-            cv2.fillPoly(mask, [np.array(points, dtype=np.int32)], 255)
-    if not np.any(mask):
-        return image_bytes
-    scale = min(image_width / ocr_width, image_height / ocr_height)
-    padding = max(2, round(scale * 1.5))
-    kernel_size = padding * 2 + 1
-    mask = cv2.dilate(mask, np.ones((kernel_size, kernel_size), dtype=np.uint8), iterations=1)
-    cleaned = cv2.inpaint(image, mask, max(3, padding), cv2.INPAINT_TELEA)
-    success, encoded = cv2.imencode(".png", cleaned)
-    return encoded.tobytes() if success else image_bytes
-
-
-def remove_ocr_text_from_embedded_images(
-    blocks: list[dict[str, object]],
-    ocr_regions: list[dict[str, object]],
-    page_width: float,
-    page_height: float,
-    azure_width: float,
-    azure_height: float,
-) -> None:
-    if not ocr_regions or not azure_width or not azure_height:
-        return
-    for block in blocks:
-        if block.get("type") != "image":
-            continue
-        left, top, right, bottom = block["bbox"]
-        block_width = right - left
-        block_height = bottom - top
-        if block_width <= 0 or block_height <= 0:
-            continue
-        local_regions: list[dict[str, object]] = []
-        for region in ocr_regions:
-            polygon = region.get("polygon", [])
-            if len(polygon) < 6:
-                continue
-            xs = [float(polygon[i]) / azure_width * page_width for i in range(0, len(polygon) - 1, 2)]
-            ys = [float(polygon[i + 1]) / azure_height * page_height for i in range(0, len(polygon) - 1, 2)]
-            center_x, center_y = sum(xs) / len(xs), sum(ys) / len(ys)
-            if not (left <= center_x <= right and top <= center_y <= bottom):
-                continue
-            local_regions.append({"polygon": [value for x, y in zip(xs, ys) for value in (x - left, y - top)]})
-        if not local_regions:
-            continue
-        cleaned = remove_ocr_text_from_background(block["data"], local_regions, block_width, block_height)
-        if cleaned != block["data"]:
-            block["data"] = cleaned
-            block["ext"] = "png"
 
 
 @app.get("/api/v1/downloads/{conversion_id}")
@@ -711,7 +627,7 @@ def build_epub(title: str, pages: list[dict[str, object]], layout: str = "auto",
 </package>'''
     nav_items = "".join(f'<li><a href="{name}">Page {index}</a></li>' for index, (name, _) in enumerate(page_documents, start=1))
     nav = f'''<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{safe_title}</title></head><body><nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><h1>Contents</h1><ol>{nav_items}</ol></nav></body></html>'''
-    style = ".-epub-media-overlay-active { background: #fff2a8 !important; } .page { margin: 0 auto; } .page.fixed { position: relative; overflow: hidden; page-break-after: always; } .page.reflowable { max-width: 48rem; padding: 2rem 1.5rem; } .fixed .page-text { position: absolute; inset: 0; z-index: 2; } .fixed .accessibility-text { width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: normal; border: 0; } .fixed .accessibility-text p { margin: 0; } .fixed .ocr-text-layer { width: auto; height: auto; margin: 0; overflow: visible; clip: auto; white-space: normal; color: #17232b; } .fixed .ocr-line { position: absolute; white-space: nowrap; overflow: hidden; } .pdf-page-background { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 1; } .pdf-span { display: inline; vertical-align: baseline; } .reflow-image { display: block; max-width: 100%; height: auto; margin: 1rem auto; } .reflow-paragraph { margin: 0 0 .75rem; line-height: 1.45; } .reflow-field { display: block; margin: .75rem 0; color: #17232b; } .reflow-field input, .reflow-field select { margin-left: .5rem; padding: .35rem; } .pdf-widget { position: absolute; z-index: 4; box-sizing: border-box; font: inherit; color: #111; background: rgba(255,255,255,.88); border: 1px solid #4d6670; padding: 2px 4px; } .pdf-checkbox, .pdf-radio { padding: 0; accent-color: #0c7770; background: rgba(255,255,255,.95); } .pdf-select { padding: 0 2px; } .pdf-media { z-index: 5; background: rgba(255,255,255,.95); }"
+    style = ".-epub-media-overlay-active { background: #fff2a8 !important; } .page { margin: 0 auto; } .page.fixed { position: relative; overflow: hidden; page-break-after: always; } .page.reflowable { max-width: 48rem; padding: 2rem 1.5rem; } .fixed .page-text { position: absolute; inset: 0; z-index: 2; } .fixed .accessibility-text { width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: normal; border: 0; } .fixed .accessibility-text p { margin: 0; } .fixed .ocr-text-layer { width: auto; height: auto; margin: 0; overflow: visible; clip: auto; white-space: normal; } .fixed .ocr-line { position: absolute; white-space: nowrap; overflow: hidden; color: transparent; } .fixed .ocr-line::selection { background: #b7dcff88; } .pdf-page-background { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 1; } .pdf-span { display: inline; vertical-align: baseline; } .reflow-image { display: block; max-width: 100%; height: auto; margin: 1rem auto; } .reflow-paragraph { margin: 0 0 .75rem; line-height: 1.45; } .reflow-field { display: block; margin: .75rem 0; color: #17232b; } .reflow-field input, .reflow-field select { margin-left: .5rem; padding: .35rem; } .pdf-widget { position: absolute; z-index: 4; box-sizing: border-box; font: inherit; color: #111; background: rgba(255,255,255,.88); border: 1px solid #4d6670; padding: 2px 4px; } .pdf-checkbox, .pdf-radio { padding: 0; accent-color: #0c7770; background: rgba(255,255,255,.95); } .pdf-select { padding: 0 2px; } .pdf-media { z-index: 5; background: rgba(255,255,255,.95); }"
     output = BytesIO()
     with ZipFile(output, "w") as archive:
         archive.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
